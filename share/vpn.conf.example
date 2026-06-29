@@ -1,0 +1,26 @@
+# openfortivpn configuration — template.
+#
+# Copy this to your config dir and fill in your gateway's details:
+#   ~/.config/vpncli/vpn.conf            (or $VPNCLI_CONFIG_DIR/vpn.conf)
+# `vpnctl setup` does this for you and can prompt for the values below.
+#
+# This file is the process fingerprint, too: the monitor finds the running
+# tunnel with `pgrep -f <this file's path>`, so it must be a stable, unique path.
+
+# VPN gateway hostname or IP.
+host = vpn.example.com
+
+# Gateway port (FortiGate SSL-VPN default is usually 443 or 8443).
+port = 443
+
+# Your VPN username.
+username = your.username
+
+# Use the DNS servers the gateway pushes (recommended for split/full tunnels).
+pppd-use-peerdns = 1
+
+# Pin the gateway's certificate. Leave the placeholder and run a connect once;
+# openfortivpn prints the SHA-256 digest to trust, e.g.:
+#   trusted-cert = <64-hex-sha256-of-the-gateway-cert>
+# Then paste it here. Until set, openfortivpn will refuse an unknown cert.
+trusted-cert = REPLACE_WITH_GATEWAY_CERT_SHA256

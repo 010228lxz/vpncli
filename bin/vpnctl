@@ -1,0 +1,751 @@
+#!/usr/bin/env bash
+#
+# vpnctl — bring up and self-supervise an openfortivpn tunnel.
+#
+# Portable across macOS (Intel/ARM) and Linux. Code is read-only and may live in
+# a Homebrew prefix; per-machine config and state live under the user's home
+# (XDG dirs), so this survives `brew install`. See `vpnctl doctor` / `setup`.
+
+set -u
+
+# Everything this tool writes (config, logs, pid, temp files) is owner-only.
+umask 077
+
+# ---------------------------------------------------------------------------
+# Resolve our own real path (through symlinks, e.g. Homebrew's bin symlink) so
+# we can find the libexec helper and re-exec ourselves as the monitor daemon.
+# ---------------------------------------------------------------------------
+_src="${BASH_SOURCE[0]:-$0}"
+while [ -h "$_src" ]; do
+    _dir="$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)"
+    _link="$(readlink "$_src")"
+    case "$_link" in
+        /*) _src="$_link" ;;
+        *)  _src="$_dir/$_link" ;;
+    esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)"
+SELF="$SCRIPT_DIR/$(basename "$_src")"
+PROG="$(basename "$_src")"
+
+OS="$(uname -s)"
+USER="${USER:-$(id -un)}"
+
+# ---------------------------------------------------------------------------
+# Config / state locations (XDG, overridable). Code is found relative to SELF.
+# ---------------------------------------------------------------------------
+CONFIG_DIR="${VPNCLI_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/vpncli}"
+STATE_DIR="${VPNCLI_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/vpncli}"
+CONFIG_PATH="$CONFIG_DIR/vpn.conf"
+SETTINGS_FILE="$CONFIG_DIR/settings"
+LOG_FILE="$STATE_DIR/vpn.log"
+PID_FILE="$STATE_DIR/vpn.pid"
+
+# ---------------------------------------------------------------------------
+# Defaults (override any of these in $SETTINGS_FILE).
+# ---------------------------------------------------------------------------
+OPENFORTIVPN=""                       # empty → auto-detect
+SECRET_SERVICE="vpncli"               # secret store service/account label
+SECRET_BACKEND="auto"                 # auto | security | secret-tool | pass
+INTERVAL=10                           # seconds between health checks
+CONNECT_GRACE=20                      # seconds to let a fresh tunnel come up
+HALF_OPEN_CHECKS=3                    # "process up, no ppp" checks before reconnect
+MAX_LOG_BYTES=1048576                 # rotate vpn.log past 1 MB
+SUDOERS_PATH="/etc/sudoers.d/vpncli"  # where the generated rule is installed
+
+if [ -f "$SETTINGS_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$SETTINGS_FILE"
+fi
+
+TUNNEL_PID=""
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
+
+log() {
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    printf '%s: %s\n' "$(date)" "$*" >> "$LOG_FILE"
+}
+
+usage() {
+    cat <<EOF
+Usage: $PROG <command>
+
+  start              Start the background monitor (auto-reconnecting tunnel)
+  stop               Stop the monitor; its trap tears the tunnel down
+  restart
+  status             Monitor + tunnel state
+  routes             VPN routes, and whether it's a FULL or SPLIT tunnel
+  logs [-f]          Show (or follow) the log
+  doctor             Diagnostics — run this first when anything is wrong
+  setup              First-run setup: config + password + sudoers
+  set-password       Store the VPN password in the OS secret store
+  install-sudoers    (Re)install the passwordless-sudo rule for this machine
+  uninstall-sudoers  Remove the passwordless-sudo rule
+
+Config:  $CONFIG_PATH
+State:   $STATE_DIR
+EOF
+    exit 1
+}
+
+# Find a bundled asset (helper or template) across installed + dev layouts.
+find_asset() {
+    local f="$1" c
+    for c in \
+        "$SCRIPT_DIR/../libexec/$f" \
+        "$SCRIPT_DIR/../share/vpncli/$f" \
+        "$SCRIPT_DIR/../share/$f" \
+        "$SCRIPT_DIR/$f" \
+        "$SCRIPT_DIR/../$f"; do
+        if [ -e "$c" ]; then printf '%s\n' "$c"; return 0; fi
+    done
+    return 1
+}
+
+detect_openfortivpn() {
+    local p
+    if p="$(command -v openfortivpn 2>/dev/null)" && [ -n "$p" ]; then
+        printf '%s\n' "$p"; return 0
+    fi
+    for p in /opt/homebrew/bin/openfortivpn /usr/local/bin/openfortivpn \
+             /usr/bin/openfortivpn /usr/sbin/openfortivpn; do
+        if [ -x "$p" ]; then printf '%s\n' "$p"; return 0; fi
+    done
+    return 1
+}
+
+resolve_secret_backend() {
+    if [ "$SECRET_BACKEND" != "auto" ]; then
+        printf '%s\n' "$SECRET_BACKEND"; return 0
+    fi
+    if [ "$OS" = "Darwin" ] && command -v security >/dev/null 2>&1; then
+        echo security; return 0
+    fi
+    # secret-tool needs a running secret service (D-Bus session + keyring),
+    # which headless servers lack — prefer it only when a session bus is
+    # present, else fall back to pass (works headless). Last resort: whichever
+    # exists. Override explicitly with SECRET_BACKEND in settings.
+    if command -v secret-tool >/dev/null 2>&1 && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        echo secret-tool; return 0
+    fi
+    if command -v pass        >/dev/null 2>&1; then echo pass;        return 0; fi
+    if command -v secret-tool >/dev/null 2>&1; then echo secret-tool; return 0; fi
+    return 1
+}
+
+# --- secret store abstraction ---------------------------------------------
+secret_get() {
+    case "$SECRET_BACKEND_RESOLVED" in
+        security)    security find-generic-password -a "$USER" -s "$SECRET_SERVICE" -w 2>/dev/null ;;
+        secret-tool) secret-tool lookup service "$SECRET_SERVICE" account "$USER" 2>/dev/null ;;
+        pass)        pass show "$SECRET_SERVICE/$USER" 2>/dev/null ;;
+        *)           return 1 ;;
+    esac
+}
+
+secret_set() {
+    local pw="$1"
+    case "$SECRET_BACKEND_RESOLVED" in
+        security)
+            # Pass the value with -w. (A bare -w makes `security` prompt on the
+            # tty and ignore stdin, so piping the password doesn't work when a
+            # terminal is attached.) The value is briefly visible in this single
+            # `security` invocation's argv — a one-time, local, interactive
+            # trade-off, unlike the per-connection exposure this design removes.
+            security add-generic-password -U -a "$USER" -s "$SECRET_SERVICE" -w "$pw" >/dev/null 2>&1 ;;
+        secret-tool)
+            printf '%s' "$pw" | secret-tool store --label="$SECRET_SERVICE" \
+                service "$SECRET_SERVICE" account "$USER" >/dev/null 2>&1 ;;
+        pass)
+            printf '%s\n' "$pw" | pass insert -m -f "$SECRET_SERVICE/$USER" >/dev/null 2>&1 ;;
+        *)  return 1 ;;
+    esac
+}
+
+secret_present() {
+    local v
+    v="$(secret_get)" && [ -n "$v" ]
+}
+
+# --- network abstraction ---------------------------------------------------
+# Echoes "<iface> <ip>" for the first ppp interface that has an inet address.
+# Scoped to ppp* so it ignores unrelated utun*/other VPNs (openfortivpn uses
+# pppd → ppp0 on both macOS and Linux).
+ppp_inet() {
+    local out i ip
+    if [ "$OS" = "Linux" ] && command -v ip >/dev/null 2>&1; then
+        out="$(ip -o -4 addr show 2>/dev/null \
+            | awk '$2 ~ /^ppp[0-9]/ {split($4,a,"/"); print $2, a[1]; exit}')"
+        [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+        return 1
+    fi
+    for i in $(ifconfig -l 2>/dev/null); do
+        case "$i" in
+            ppp[0-9]*)
+                ip="$(ifconfig "$i" 2>/dev/null | awk '/inet /{print $2; exit}')"
+                [ -n "$ip" ] && { printf '%s %s\n' "$i" "$ip"; return 0; }
+                ;;
+        esac
+    done
+    return 1
+}
+
+# Interface that general internet traffic egresses on (for FULL vs SPLIT).
+net_default_iface() {
+    if [ "$OS" = "Linux" ] && command -v ip >/dev/null 2>&1; then
+        ip route get 8.8.8.8 2>/dev/null \
+            | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+        return
+    fi
+    route -n get 8.8.8.8 2>/dev/null | awk '/interface:/{print $2; exit}'
+}
+
+file_size() {
+    wc -c < "$1" 2>/dev/null | tr -d ' '
+}
+
+# True only if a NOPASSWD rule grants the EXACT command line in "$*".
+# `sudo -n -l <cmd>` can't be used: it returns success for anything the user may
+# run *with* a password (e.g. a blanket "(ALL) ALL"). The full `sudo -n -l`
+# listing instead names NOPASSWD entries explicitly, and (under the default
+# listpw=any) prints without a password whenever any NOPASSWD rule exists.
+sudo_has_nopasswd() {
+    local want="$*" haystack
+    haystack="$(sudo -n -l 2>/dev/null | tr '\n' ' ' | tr -s ' ') "
+    case "$haystack" in
+        *"NOPASSWD: $want "*) return 0 ;;
+        *)                    return 1 ;;
+    esac
+}
+
+# Prints the monitor's pid and returns success only if it's actually alive.
+monitor_pid() {
+    [ -f "$PID_FILE" ] || return 1
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+}
+
+tunnel_running() {
+    pgrep -f "$CONFIG_PATH" >/dev/null 2>&1
+}
+
+# Healthy = openfortivpn process is alive AND the ppp tunnel has an IP.
+vpn_healthy() {
+    tunnel_running && ppp_inet >/dev/null 2>&1
+}
+
+rotate_log() {
+    [ -f "$LOG_FILE" ] || return 0
+    local size
+    size="$(file_size "$LOG_FILE")"; [ -n "$size" ] || size=0
+    if [ "$size" -gt "$MAX_LOG_BYTES" ]; then
+        mv -f "$LOG_FILE" "$LOG_FILE.1"
+    fi
+}
+
+require_config() {
+    if [ ! -r "$CONFIG_PATH" ]; then
+        echo "Error: no readable config at $CONFIG_PATH" >&2
+        echo "Run: $PROG setup" >&2
+        return 1
+    fi
+}
+
+load_credentials() {
+    local pw
+    if ! pw="$(secret_get)" || [ -z "$pw" ]; then
+        log "Failed to retrieve a usable VPN password from the secret store ($SECRET_BACKEND_RESOLVED:$SECRET_SERVICE)"
+        return 1
+    fi
+    # Exported so fortiVPN.expect reads it from the environment, never argv,
+    # keeping it out of `ps`.
+    export VPN_PASSWORD="$pw"
+}
+
+launch_tunnel() {
+    "$EXPECT_SCRIPT" "$OPENFORTIVPN" "$CONFIG_PATH" >> "$LOG_FILE" 2>&1 &
+    TUNNEL_PID=$!
+    log "Launched tunnel (expect pid $TUNNEL_PID)"
+}
+
+# Used by the backgrounded monitor: never prompts (sudo -n), so it can't hang.
+teardown_tunnel() {
+    if [ -n "$TUNNEL_PID" ] && kill -0 "$TUNNEL_PID" 2>/dev/null; then
+        kill "$TUNNEL_PID" 2>/dev/null
+        wait "$TUNNEL_PID" 2>/dev/null
+    fi
+    TUNNEL_PID=""
+    if tunnel_running; then
+        sudo -n "$PKILL" -f "$CONFIG_PATH" 2>/dev/null
+    fi
+}
+
+# ===========================================================================
+# Monitor daemon
+# ===========================================================================
+run_monitor() {
+    trap 'log "Stop signal received — tearing down"; teardown_tunnel; rm -f "$PID_FILE"; exit 0' TERM INT
+
+    if [ -z "$OPENFORTIVPN" ]; then
+        log "Exiting: openfortivpn not found"; rm -f "$PID_FILE"; exit 1
+    fi
+    if ! load_credentials; then
+        log "Exiting: no usable credentials"; rm -f "$PID_FILE"; exit 1
+    fi
+
+    local streak=0
+    while true; do
+        rotate_log
+        if vpn_healthy; then
+            streak=0
+        elif ! tunnel_running; then
+            log "Tunnel down (no process) — connecting"
+            teardown_tunnel
+            launch_tunnel
+            streak=0
+            sleep "$CONNECT_GRACE"
+        else
+            # Process alive but no ppp interface: still connecting or half-open.
+            streak=$((streak + 1))
+            if [ "$streak" -ge "$HALF_OPEN_CHECKS" ]; then
+                log "Tunnel half-open ($streak checks, no ppp) — reconnecting"
+                teardown_tunnel
+                launch_tunnel
+                streak=0
+                sleep "$CONNECT_GRACE"
+            fi
+        fi
+        sleep "$INTERVAL"
+    done
+}
+
+# ===========================================================================
+# Subcommands
+# ===========================================================================
+do_start() {
+    local pid newpid
+    if pid="$(monitor_pid)"; then
+        echo "Already running (monitor pid $pid)"
+        return 0
+    fi
+    require_config || return 1
+    if [ -z "$OPENFORTIVPN" ]; then
+        echo "Error: openfortivpn not found. Install it, or set OPENFORTIVPN in $SETTINGS_FILE." >&2
+        return 1
+    fi
+    if [ -z "$EXPECT_SCRIPT" ]; then
+        echo "Error: fortiVPN.expect helper not found near $SCRIPT_DIR." >&2
+        return 1
+    fi
+    if ! sudo_has_nopasswd "$OPENFORTIVPN -c $CONFIG_PATH"; then
+        echo "Error: passwordless sudo is not configured for this exact command." >&2
+        echo "Run: $PROG install-sudoers   (or: $PROG setup)" >&2
+        return 1
+    fi
+
+    rotate_log
+    mkdir -p "$STATE_DIR"
+    nohup "$SELF" __run__ >> "$LOG_FILE" 2>&1 &
+    newpid=$!
+    disown 2>/dev/null || true
+    echo "$newpid" > "$PID_FILE"
+    log "Monitor started (pid $newpid)"
+    echo "Started (monitor pid $newpid)"
+}
+
+do_stop() {
+    local pid
+    if pid="$(monitor_pid)"; then
+        kill "$pid" 2>/dev/null    # monitor's trap tears the tunnel down
+        log "Monitor stopped (pid $pid)"
+        echo "Monitor stopped (pid $pid)"
+        sleep 1                    # give the trap a moment to run
+    else
+        echo "Monitor was not running"
+    fi
+    rm -f "$PID_FILE"
+
+    # Fallback in case the monitor died uncleanly and left the tunnel up.
+    if tunnel_running; then
+        echo "Tearing down tunnel (may prompt for sudo password)..."
+        sudo "$PKILL" -f "$CONFIG_PATH" 2>/dev/null
+    fi
+}
+
+do_restart() {
+    do_stop
+    sleep 1
+    do_start
+}
+
+do_status() {
+    local pid inet
+    if pid="$(monitor_pid)"; then
+        echo "Monitor: running (pid $pid)"
+    else
+        echo "Monitor: stopped"
+    fi
+
+    if inet="$(ppp_inet)"; then
+        echo "Tunnel:  connected ($inet)"
+    elif tunnel_running; then
+        echo "Tunnel:  connecting (process up, no ppp interface yet)"
+    else
+        echo "Tunnel:  disconnected"
+    fi
+}
+
+do_routes() {
+    local inet iface def_if count
+    if ! inet="$(ppp_inet)"; then
+        echo "Tunnel: disconnected — no ppp interface is up, so there are no VPN routes."
+        return 1
+    fi
+    iface="${inet%% *}"
+
+    def_if="$(net_default_iface)"
+    if [ "$def_if" = "$iface" ]; then
+        echo "Mode:   FULL tunnel — all traffic routes through the VPN ($iface)"
+    else
+        echo "Mode:   SPLIT tunnel — only the networks below use the VPN ($iface)"
+        echo "        General internet egresses via ${def_if:-unknown}"
+    fi
+
+    if [ "$OS" = "Linux" ] && command -v ip >/dev/null 2>&1; then
+        count="$(ip route show dev "$iface" 2>/dev/null | wc -l | tr -d ' ')"
+        echo "Routes: $count via $iface"
+        echo
+        ip route show dev "$iface" 2>/dev/null | sed 's/^/  /'
+    else
+        count="$(netstat -rn -f inet 2>/dev/null | awk -v ifc="$iface" '$NF==ifc' | wc -l | tr -d ' ')"
+        echo "Routes: $count via $iface"
+        echo
+        printf '  %-22s %-18s %s\n' "DESTINATION" "GATEWAY" "FLAGS"
+        printf '  %-22s %-18s %s\n' "-----------" "-------" "-----"
+        netstat -rn -f inet 2>/dev/null | awk -v ifc="$iface" '$NF==ifc {printf "  %-22s %-18s %s\n", $1, $2, $3}'
+    fi
+}
+
+do_logs() {
+    if [ ! -f "$LOG_FILE" ]; then
+        echo "No log file yet at $LOG_FILE"
+        return 1
+    fi
+    if [ "${1:-}" = "-f" ] || [ "${1:-}" = "--follow" ]; then
+        echo "Tailing $LOG_FILE (Ctrl-C to stop)..."
+        tail -n 50 -f "$LOG_FILE"
+    else
+        tail -n 50 "$LOG_FILE"
+    fi
+}
+
+_DOCTOR_FAIL=0
+report() {
+    case "$1" in
+        ok)   echo "  [ ok ] $2" ;;
+        warn) echo "  [warn] $2" ;;
+        fail) echo "  [FAIL] $2"; _DOCTOR_FAIL=1 ;;
+        info) echo "  [info] $2" ;;
+    esac
+}
+
+do_doctor() {
+    _DOCTOR_FAIL=0
+    local pid inet
+    echo "vpnctl diagnostics:"
+    echo
+    report info "OS: $OS    user: $USER"
+    report info "config dir: $CONFIG_DIR"
+    report info "state dir:  $STATE_DIR"
+    echo
+
+    if [ -n "$OPENFORTIVPN" ] && [ -x "$OPENFORTIVPN" ]; then
+        report ok "openfortivpn found ($OPENFORTIVPN)"
+    else
+        report fail "openfortivpn not found — install it (brew/apt) or set OPENFORTIVPN in $SETTINGS_FILE"
+    fi
+
+    if [ -n "$EXPECT_SCRIPT" ] && [ -x "$EXPECT_SCRIPT" ]; then
+        report ok "expect helper present ($EXPECT_SCRIPT)"
+    elif [ -n "$EXPECT_SCRIPT" ]; then
+        report fail "expect helper present but not executable: $EXPECT_SCRIPT"
+    else
+        report fail "expect helper not found near $SCRIPT_DIR"
+    fi
+
+    if command -v expect >/dev/null 2>&1; then
+        report ok "'expect' interpreter installed"
+    else
+        report fail "'expect' interpreter missing — install it (brew install expect / apt install expect)"
+    fi
+
+    if [ -r "$CONFIG_PATH" ]; then
+        if grep -q '^[[:space:]]*host' "$CONFIG_PATH" && grep -q '^[[:space:]]*trusted-cert' "$CONFIG_PATH"; then
+            if grep -q 'REPLACE_WITH_GATEWAY_CERT_SHA256' "$CONFIG_PATH"; then
+                report warn "config present but trusted-cert is still the placeholder ($CONFIG_PATH)"
+            else
+                report ok "config readable with host + trusted-cert ($CONFIG_PATH)"
+            fi
+        else
+            report fail "config $CONFIG_PATH is missing a host or trusted-cert line"
+        fi
+    else
+        report fail "no config at $CONFIG_PATH — run: $PROG setup"
+    fi
+
+    if [ -z "$SECRET_BACKEND_RESOLVED" ]; then
+        report fail "no secret backend available — need 'security' (macOS), 'secret-tool', or 'pass'"
+    elif secret_present; then
+        report ok "VPN password stored (backend: $SECRET_BACKEND_RESOLVED, service: $SECRET_SERVICE)"
+    else
+        report fail "no VPN password in $SECRET_BACKEND_RESOLVED (service: $SECRET_SERVICE) — run: $PROG set-password"
+    fi
+
+    if [ -n "$OPENFORTIVPN" ] && sudo_has_nopasswd "$OPENFORTIVPN -c $CONFIG_PATH"; then
+        report ok "passwordless sudo for the openfortivpn launch command"
+    else
+        report fail "passwordless sudo for openfortivpn missing/mismatched — run: $PROG install-sudoers"
+    fi
+
+    if sudo_has_nopasswd "$PKILL -f $CONFIG_PATH"; then
+        report ok "passwordless sudo for tunnel teardown (pkill)"
+    else
+        report fail "passwordless sudo for pkill missing — half-open recovery will need a password (run: $PROG install-sudoers)"
+    fi
+
+    echo
+    if pid="$(monitor_pid)"; then
+        report info "monitor running (pid $pid)"
+    else
+        report info "monitor not running"
+    fi
+    if inet="$(ppp_inet)"; then
+        report info "tunnel connected ($inet)"
+    elif tunnel_running; then
+        report info "tunnel connecting (process up, no ppp interface yet)"
+    else
+        report info "tunnel disconnected"
+    fi
+
+    echo
+    if [ "$_DOCTOR_FAIL" -ne 0 ]; then
+        echo "Result: problems found — see the [FAIL] lines above."
+        return 1
+    fi
+    echo "Result: all checks passed."
+    return 0
+}
+
+do_set_password() {
+    local p1 p2 tries
+    if [ -z "$SECRET_BACKEND_RESOLVED" ]; then
+        echo "Error: no secret backend available (need 'security', 'secret-tool', or 'pass')." >&2
+        return 1
+    fi
+    tries=0
+    while :; do
+        tries=$((tries + 1))
+        printf 'Enter VPN password: '
+        read -rs p1; echo
+        printf 'Confirm VPN password: '
+        read -rs p2; echo
+        if [ -z "$p1" ]; then
+            echo "Empty password." >&2
+        elif [ "$p1" != "$p2" ]; then
+            echo "Passwords do not match." >&2
+        else
+            break
+        fi
+        if [ "$tries" -ge 3 ]; then
+            echo "Aborted after 3 attempts." >&2; return 1
+        fi
+        echo "Try again." >&2
+    done
+
+    if secret_set "$p1"; then
+        echo "Stored VPN password (backend: $SECRET_BACKEND_RESOLVED, service: $SECRET_SERVICE)."
+        echo "Verify with: $PROG doctor"
+    else
+        echo "Failed to store password in the secret store." >&2; return 1
+    fi
+}
+
+# Set/replace a "key = value" line in the config (append if absent).
+# Pure-bash rewrite (no sed/awk), so values containing &, |, \, etc. stay
+# literal instead of being interpreted as replacement syntax or a delimiter.
+conf_set() {
+    local key="$1" val="$2" tmp line found=0
+    tmp="$(mktemp "${TMPDIR:-/tmp}/vpncli.conf.XXXXXX")" || return 1
+    if [ -f "$CONFIG_PATH" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            if [ "$found" -eq 0 ] && [[ "$line" =~ ^[[:space:]]*"$key"[[:space:]]*= ]]; then
+                printf '%s = %s\n' "$key" "$val"
+                found=1
+            else
+                printf '%s\n' "$line"
+            fi
+        done < "$CONFIG_PATH" > "$tmp"
+    fi
+    if [ "$found" -eq 0 ]; then
+        printf '%s = %s\n' "$key" "$val" >> "$tmp"
+    fi
+    mv "$tmp" "$CONFIG_PATH"
+}
+
+prompt_config() {
+    local host port user
+    echo "Enter your VPN gateway details (blank = keep template value):"
+    printf '  Host (e.g. vpn.example.com): '; read -r host
+    printf '  Port [443]: '; read -r port
+    printf '  Username: '; read -r user
+    [ -n "$host" ] && conf_set host "$host"
+    [ -n "$port" ] && conf_set port "$port"
+    [ -n "$user" ] && conf_set username "$user"
+    echo
+    echo "trusted-cert: connect once; openfortivpn prints the gateway's SHA-256 to trust."
+    echo "Paste it into the 'trusted-cert =' line of $CONFIG_PATH before connecting."
+}
+
+do_install_sudoers() {
+    local tmpl tmp _p
+    tmpl="$(find_asset vpncli.sudoers.template)" || {
+        echo "Error: sudoers template not found near $SCRIPT_DIR." >&2; return 1; }
+    if [ -z "$OPENFORTIVPN" ]; then
+        echo "Error: openfortivpn not found; set OPENFORTIVPN in $SETTINGS_FILE first." >&2; return 1
+    fi
+    require_config || return 1
+
+    # sudo matches the rule as a literal, whitespace-delimited command line, so a
+    # space anywhere in these paths would silently break passwordless matching
+    # (and teardown). Fail early with guidance instead.
+    for _p in "$OPENFORTIVPN" "$CONFIG_PATH" "$PKILL"; do
+        case "$_p" in
+            *[[:space:]]*)
+                echo "Error: this path contains whitespace, which breaks passwordless-sudo matching:" >&2
+                echo "  $_p" >&2
+                echo "Use a space-free location (e.g. set VPNCLI_CONFIG_DIR) and retry." >&2
+                return 1 ;;
+        esac
+    done
+
+    tmp="$(mktemp "${TMPDIR:-/tmp}/vpncli.sudoers.XXXXXX")" || return 1
+    sed -e "s|__USER__|$USER|g" \
+        -e "s|__OPENFORTIVPN__|$OPENFORTIVPN|g" \
+        -e "s|__CONFIG__|$CONFIG_PATH|g" \
+        -e "s|__PKILL__|$PKILL|g" \
+        "$tmpl" > "$tmp"
+
+    if ! visudo -cf "$tmp" >/dev/null 2>&1; then
+        echo "Error: generated sudoers failed validation:" >&2
+        visudo -cf "$tmp" >&2
+        rm -f "$tmp"; return 1
+    fi
+
+    echo "Installing passwordless-sudo rule to $SUDOERS_PATH (requires sudo):"
+    echo "  user:         $USER"
+    echo "  openfortivpn: $OPENFORTIVPN"
+    echo "  config:       $CONFIG_PATH"
+    echo "  pkill:        $PKILL"
+    if sudo install -m 0440 "$tmp" "$SUDOERS_PATH"; then
+        rm -f "$tmp"
+        echo "Installed. Verify with: $PROG doctor"
+    else
+        rm -f "$tmp"
+        echo "Failed to install sudoers rule." >&2; return 1
+    fi
+}
+
+do_uninstall_sudoers() {
+    if [ -f "$SUDOERS_PATH" ]; then
+        echo "Removing $SUDOERS_PATH (requires sudo)..."
+        sudo rm -f "$SUDOERS_PATH" && echo "Removed."
+    else
+        echo "No sudoers rule at $SUDOERS_PATH"
+    fi
+}
+
+do_setup() {
+    local c imported cand ex ans
+    echo "vpnCLI setup"
+    echo
+    mkdir -p "$CONFIG_DIR" "$STATE_DIR"
+    chmod 700 "$CONFIG_DIR" "$STATE_DIR" 2>/dev/null   # tighten if dirs pre-existed
+
+    # 1. Config
+    if [ -r "$CONFIG_PATH" ]; then
+        echo "Config already present: $CONFIG_PATH"
+    else
+        # Only consider configs tied to the install/clone location — never the
+        # current directory, so running setup elsewhere can't import a stray
+        # vpn.conf. Confirm before importing so it's never a surprise.
+        imported=""
+        cand=""
+        for c in "$SCRIPT_DIR/../vpn.conf" "$SCRIPT_DIR/vpn.conf"; do
+            if [ -r "$c" ] && [ "$c" != "$CONFIG_PATH" ]; then cand="$c"; break; fi
+        done
+        if [ -n "$cand" ]; then
+            printf 'Found an existing config at %s\n' "$cand"
+            printf 'Import it into %s? [Y/n] ' "$CONFIG_PATH"
+            read -r ans
+            case "$ans" in
+                [Nn]*) ;;
+                *)     cp "$cand" "$CONFIG_PATH" && imported="$cand" ;;
+            esac
+        fi
+        if [ -n "$imported" ]; then
+            echo "Imported existing config: $imported → $CONFIG_PATH"
+        else
+            ex="$(find_asset vpn.conf.example)" && cp "$ex" "$CONFIG_PATH"
+            echo "Created config from template: $CONFIG_PATH"
+            prompt_config
+        fi
+    fi
+    chmod 600 "$CONFIG_PATH" 2>/dev/null
+    echo
+
+    # 2. Password
+    if secret_present; then
+        echo "VPN password already stored (service: $SECRET_SERVICE)."
+        printf 'Re-enter it? [y/N] '; read -r ans
+        case "$ans" in [Yy]*) do_set_password ;; esac
+    else
+        do_set_password
+    fi
+    echo
+
+    # 3. Sudoers
+    do_install_sudoers
+    echo
+
+    # 4. Diagnostics
+    do_doctor
+}
+
+# ===========================================================================
+# Post-config resolution (needs the functions above)
+# ===========================================================================
+PKILL="$(command -v pkill 2>/dev/null || echo /usr/bin/pkill)"
+[ -z "$OPENFORTIVPN" ] && OPENFORTIVPN="$(detect_openfortivpn || true)"
+EXPECT_SCRIPT="$(find_asset fortiVPN.expect || true)"
+SECRET_BACKEND_RESOLVED="$(resolve_secret_backend || true)"
+
+case "${1:-}" in
+    start)             do_start ;;
+    stop)              do_stop ;;
+    restart)           do_restart ;;
+    status)            do_status ;;
+    routes)            do_routes ;;
+    logs)              do_logs "${2:-}" ;;
+    doctor)            do_doctor ;;
+    setup)             do_setup ;;
+    set-password)      do_set_password ;;
+    install-sudoers)   do_install_sudoers ;;
+    uninstall-sudoers) do_uninstall_sudoers ;;
+    __run__)           run_monitor ;;
+    -h|--help|help)    usage ;;
+    *)                 usage ;;
+esac

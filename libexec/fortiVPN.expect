@@ -1,0 +1,50 @@
+#!/usr/bin/env expect -f
+# Brings up the VPN via openfortivpn, answering the VPN password prompt.
+#
+#   argv0 : absolute path to the openfortivpn binary
+#   argv1 : absolute path to the openfortivpn config file
+#
+# The binary path is passed in (not hardcoded) so the same value the caller
+# wrote into the sudoers rule is what we spawn — the NOPASSWD match lines up on
+# any machine (Intel/ARM Homebrew, Linux, custom prefix).
+#
+# The VPN password is read from the VPN_PASSWORD environment variable so it
+# never appears in the process list (`ps`). sudo must be configured passwordless
+# for this exact command (see `vpnctl install-sudoers`); if it isn't, this
+# exits with a clear error instead of silently hanging on sudo's password prompt.
+
+set timeout 45
+
+if {$argc < 2} {
+    puts stderr "fortiVPN.expect: usage: fortiVPN.expect <openfortivpn-path> <config-path>"
+    exit 2
+}
+set openfortivpn [lindex $argv 0]
+set configPath   [lindex $argv 1]
+
+if {![info exists env(VPN_PASSWORD)] || $env(VPN_PASSWORD) eq ""} {
+    puts stderr "fortiVPN.expect: VPN_PASSWORD not set in environment"
+    exit 1
+}
+set vpnpwd $env(VPN_PASSWORD)
+
+spawn sudo $openfortivpn -c $configPath
+
+expect {
+    "VPN*?password:" { send -- "$vpnpwd\r" }
+    -re "assword:" {
+        puts stderr "fortiVPN.expect: got a sudo password prompt — configure passwordless sudo (run: vpnctl install-sudoers)"
+        exit 1
+    }
+    timeout {
+        puts stderr "fortiVPN.expect: timed out waiting for the VPN password prompt"
+        exit 1
+    }
+    eof {
+        puts stderr "fortiVPN.expect: openfortivpn exited before the password prompt"
+        exit 1
+    }
+}
+
+# Stay attached for the life of the tunnel; return only when openfortivpn exits.
+expect eof

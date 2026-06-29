@@ -1,0 +1,18 @@
+# Per-machine secrets / config — never commit. Use share/vpn.conf.example as
+# the template; real values live in ~/.config/vpncli/vpn.conf (or an imported
+# repo-local vpn.conf, kept untracked here so `vpnctl setup` can migrate it).
+vpn.conf
+settings
+
+# Runtime state / logs (these now live under ~/.local/state/vpncli, but ignore
+# any that land here when running from a clone).
+vpn.pid
+vpn.log
+vpn.log.*
+
+# Generated sudoers (rendered per machine by `vpnctl install-sudoers`).
+*.sudoers
+!share/vpncli.sudoers.template
+
+# macOS cruft
+.DS_Store
