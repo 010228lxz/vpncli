@@ -14,18 +14,18 @@ repo; per-machine config and credentials are created by `vpnctl setup`.
 
 ```sh
 brew tap 010228lxz/vpncli https://github.com/010228lxz/vpncli
-brew install --HEAD 010228lxz/vpncli/vpncli   # or `brew install vpncli` once a release is tagged
-vpnctl setup                                  # finish per-machine setup
+brew install 010228lxz/vpncli/vpncli   # stable v0.1.0 (add --HEAD to track main instead)
+vpnctl setup                           # finish per-machine setup
 ```
 
-(The repo is private, so tapping it requires your GitHub auth — making it public
-would let `brew install` work with no extra setup. The clone method below works
-over SSH today.)
+The explicit tap URL is needed because the repo is named `vpncli`, not
+`homebrew-vpncli` — Homebrew's short `brew tap <user>/<name>` form assumes the
+`homebrew-` prefix.
 
 ### From a clone (no Homebrew)
 
 ```sh
-git clone git@github.com:010228lxz/vpncli.git && cd vpncli
+git clone https://github.com/010228lxz/vpncli.git && cd vpncli
 ./bin/vpnctl setup
 # optionally symlink onto your PATH:
 ln -s "$PWD/bin/vpnctl" /usr/local/bin/vpnctl
