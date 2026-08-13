@@ -44,12 +44,17 @@ PID_FILE="$STATE_DIR/vpn.pid"
 # ---------------------------------------------------------------------------
 # Defaults (override any of these in $SETTINGS_FILE).
 # ---------------------------------------------------------------------------
+VPN_TYPE="fortivpn"                   # fortivpn | openvpn — which backend to drive
 OPENFORTIVPN=""                       # empty → auto-detect
+OPENVPN=""                            # empty → auto-detect (openvpn backend)
+OPENVPN_USERNAME=""                   # openvpn auth-user-pass username (openvpn backend)
+TUN_IFACE=""                          # pin the tunnel iface name (openvpn on macOS: utun names are assigned dynamically and can't be scoped as precisely as ppp*/tun*; set e.g. TUN_IFACE=utun4)
 SECRET_SERVICE="vpncli"               # secret store service/account label
 SECRET_BACKEND="auto"                 # auto | security | secret-tool | pass
+OTP_SEPARATOR=""                      # inserted between password and OTP code (most RADIUS/2FA gateways want none — i.e. password immediately followed by the 6-digit code)
 INTERVAL=10                           # seconds between health checks
 CONNECT_GRACE=20                      # seconds to let a fresh tunnel come up
-HALF_OPEN_CHECKS=3                    # "process up, no ppp" checks before reconnect
+HALF_OPEN_CHECKS=3                    # "process up, no tunnel iface" checks before reconnect
 MAX_LOG_BYTES=1048576                 # rotate vpn.log past 1 MB
 SUDOERS_PATH="/etc/sudoers.d/vpncli"  # where the generated rule is installed
 
@@ -57,6 +62,13 @@ if [ -f "$SETTINGS_FILE" ]; then
     # shellcheck disable=SC1090
     . "$SETTINGS_FILE"
 fi
+
+# Per-backend config file: fortivpn uses key=value vpn.conf; openvpn uses a
+# provider-supplied .ovpn client config (different syntax, so a separate file).
+OPENVPN_CONFIG_PATH="$CONFIG_DIR/vpn.ovpn"
+# Regenerated fresh before every launch (never committed); fixed path so it can
+# be named exactly in the generated sudoers rule, same as the config path.
+OPENVPN_AUTH_FILE="$STATE_DIR/openvpn.auth"
 
 TUNNEL_PID=""
 
@@ -82,11 +94,15 @@ Usage: $PROG <command>
   doctor             Diagnostics — run this first when anything is wrong
   setup              First-run setup: config + password + sudoers
   set-password       Store the VPN password in the OS secret store
+  set-otp-secret     Store a TOTP seed; a fresh 6-digit code is appended to
+                     the password on every connect (for password+OTP gateways)
+  unset-otp-secret   Remove the stored TOTP seed
   install-sudoers    (Re)install the passwordless-sudo rule for this machine
   uninstall-sudoers  Remove the passwordless-sudo rule
 
-Config:  $CONFIG_PATH
+Config:  $CONFIG_PATH  (openvpn: $OPENVPN_CONFIG_PATH)
 State:   $STATE_DIR
+Backend: $VPN_TYPE   (set VPN_TYPE=fortivpn|openvpn in $SETTINGS_FILE)
 EOF
     exit 1
 }
@@ -117,6 +133,19 @@ detect_openfortivpn() {
     return 1
 }
 
+detect_openvpn() {
+    local p
+    if p="$(command -v openvpn 2>/dev/null)" && [ -n "$p" ]; then
+        printf '%s\n' "$p"; return 0
+    fi
+    for p in /opt/homebrew/sbin/openvpn /usr/local/sbin/openvpn \
+             /opt/homebrew/bin/openvpn /usr/local/bin/openvpn \
+             /usr/sbin/openvpn /usr/bin/openvpn; do
+        if [ -x "$p" ]; then printf '%s\n' "$p"; return 0; fi
+    done
+    return 1
+}
+
 resolve_secret_backend() {
     if [ "$SECRET_BACKEND" != "auto" ]; then
         printf '%s\n' "$SECRET_BACKEND"; return 0
@@ -137,17 +166,31 @@ resolve_secret_backend() {
 }
 
 # --- secret store abstraction ---------------------------------------------
+# "kind" selects which secret under the same $SECRET_SERVICE: "password" (the
+# default, same account as always — existing stored passwords keep working
+# unchanged) or "otp" (the TOTP seed, stored under a distinct account so it
+# never collides with the password entry).
+secret_account() {
+    case "${1:-password}" in
+        otp) printf '%s\n' "${USER}-totp" ;;
+        *)   printf '%s\n' "$USER" ;;
+    esac
+}
+
 secret_get() {
+    local kind="${1:-password}" account
+    account="$(secret_account "$kind")"
     case "$SECRET_BACKEND_RESOLVED" in
-        security)    security find-generic-password -a "$USER" -s "$SECRET_SERVICE" -w 2>/dev/null ;;
-        secret-tool) secret-tool lookup service "$SECRET_SERVICE" account "$USER" 2>/dev/null ;;
-        pass)        pass show "$SECRET_SERVICE/$USER" 2>/dev/null ;;
+        security)    security find-generic-password -a "$account" -s "$SECRET_SERVICE" -w 2>/dev/null ;;
+        secret-tool) secret-tool lookup service "$SECRET_SERVICE" account "$account" 2>/dev/null ;;
+        pass)        pass show "$SECRET_SERVICE/$account" 2>/dev/null ;;
         *)           return 1 ;;
     esac
 }
 
 secret_set() {
-    local pw="$1"
+    local pw="$1" kind="${2:-password}" account
+    account="$(secret_account "$kind")"
     case "$SECRET_BACKEND_RESOLVED" in
         security)
             # Pass the value with -w. (A bare -w makes `security` prompt on the
@@ -155,19 +198,43 @@ secret_set() {
             # terminal is attached.) The value is briefly visible in this single
             # `security` invocation's argv — a one-time, local, interactive
             # trade-off, unlike the per-connection exposure this design removes.
-            security add-generic-password -U -a "$USER" -s "$SECRET_SERVICE" -w "$pw" >/dev/null 2>&1 ;;
+            security add-generic-password -U -a "$account" -s "$SECRET_SERVICE" -w "$pw" >/dev/null 2>&1 ;;
         secret-tool)
-            printf '%s' "$pw" | secret-tool store --label="$SECRET_SERVICE" \
-                service "$SECRET_SERVICE" account "$USER" >/dev/null 2>&1 ;;
+            printf '%s' "$pw" | secret-tool store --label="$SECRET_SERVICE ($kind)" \
+                service "$SECRET_SERVICE" account "$account" >/dev/null 2>&1 ;;
         pass)
-            printf '%s\n' "$pw" | pass insert -m -f "$SECRET_SERVICE/$USER" >/dev/null 2>&1 ;;
+            printf '%s\n' "$pw" | pass insert -m -f "$SECRET_SERVICE/$account" >/dev/null 2>&1 ;;
         *)  return 1 ;;
     esac
 }
 
+secret_delete() {
+    local kind="${1:-password}" account
+    account="$(secret_account "$kind")"
+    case "$SECRET_BACKEND_RESOLVED" in
+        security)    security delete-generic-password -a "$account" -s "$SECRET_SERVICE" >/dev/null 2>&1 ;;
+        secret-tool) secret-tool clear service "$SECRET_SERVICE" account "$account" >/dev/null 2>&1 ;;
+        pass)        pass rm -f "$SECRET_SERVICE/$account" >/dev/null 2>&1 ;;
+        *)           return 1 ;;
+    esac
+}
+
 secret_present() {
-    local v
-    v="$(secret_get)" && [ -n "$v" ]
+    local kind="${1:-password}" v
+    v="$(secret_get "$kind")" && [ -n "$v" ]
+}
+
+# Generates the current 6-digit TOTP code from the stored seed via `oathtool`.
+# Called fresh on every launch attempt (codes rotate every 30s), never cached.
+otp_now() {
+    local seed
+    seed="$(secret_get otp)" || return 1
+    [ -n "$seed" ] || return 1
+    if ! command -v oathtool >/dev/null 2>&1; then
+        log "oathtool not found — install it to use OTP-appended passwords (brew install oath-toolkit / apt install oathtool)"
+        return 1
+    fi
+    oathtool --totp -b "$seed" 2>/dev/null
 }
 
 # --- network abstraction ---------------------------------------------------
@@ -203,6 +270,47 @@ net_default_iface() {
     route -n get 8.8.8.8 2>/dev/null | awk '/interface:/{print $2; exit}'
 }
 
+# Echoes "<iface> <ip>" for the openvpn tunnel interface. On Linux this is
+# unambiguous (tun[0-9]*). On macOS, openvpn's own utun driver assigns a name
+# dynamically, and utun* is also used by other things (other VPNs, Continuity,
+# etc.), so this is best-effort unless TUN_IFACE pins an exact name.
+tun_inet() {
+    local out i ip
+    if [ -n "$TUN_IFACE" ]; then
+        if [ "$OS" = "Linux" ] && command -v ip >/dev/null 2>&1; then
+            ip="$(ip -o -4 addr show dev "$TUN_IFACE" 2>/dev/null \
+                | awk '{split($4,a,"/"); print a[1]; exit}')"
+        else
+            ip="$(ifconfig "$TUN_IFACE" 2>/dev/null | awk '/inet /{print $2; exit}')"
+        fi
+        [ -n "$ip" ] && { printf '%s %s\n' "$TUN_IFACE" "$ip"; return 0; }
+        return 1
+    fi
+    if [ "$OS" = "Linux" ] && command -v ip >/dev/null 2>&1; then
+        out="$(ip -o -4 addr show 2>/dev/null \
+            | awk '$2 ~ /^tun[0-9]/ {split($4,a,"/"); print $2, a[1]; exit}')"
+        [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+        return 1
+    fi
+    for i in $(ifconfig -l 2>/dev/null); do
+        case "$i" in
+            utun[0-9]*)
+                ip="$(ifconfig "$i" 2>/dev/null | awk '/inet /{print $2; exit}')"
+                [ -n "$ip" ] && { printf '%s %s\n' "$i" "$ip"; return 0; }
+                ;;
+        esac
+    done
+    return 1
+}
+
+# Dispatches to the interface probe for the active VPN_TYPE.
+vpn_inet() {
+    case "$VPN_TYPE" in
+        openvpn) tun_inet ;;
+        *)       ppp_inet ;;
+    esac
+}
+
 file_size() {
     wc -c < "$1" 2>/dev/null | tr -d ' '
 }
@@ -230,12 +338,12 @@ monitor_pid() {
 }
 
 tunnel_running() {
-    pgrep -f "$CONFIG_PATH" >/dev/null 2>&1
+    pgrep -f "$ACTIVE_CONFIG" >/dev/null 2>&1
 }
 
-# Healthy = openfortivpn process is alive AND the ppp tunnel has an IP.
+# Healthy = the VPN process is alive AND the tunnel interface has an IP.
 vpn_healthy() {
-    tunnel_running && ppp_inet >/dev/null 2>&1
+    tunnel_running && vpn_inet >/dev/null 2>&1
 }
 
 rotate_log() {
@@ -248,28 +356,64 @@ rotate_log() {
 }
 
 require_config() {
-    if [ ! -r "$CONFIG_PATH" ]; then
-        echo "Error: no readable config at $CONFIG_PATH" >&2
+    if [ ! -r "$ACTIVE_CONFIG" ]; then
+        echo "Error: no readable $VPN_TYPE config at $ACTIVE_CONFIG" >&2
         echo "Run: $PROG setup" >&2
         return 1
     fi
 }
 
 load_credentials() {
-    local pw
-    if ! pw="$(secret_get)" || [ -z "$pw" ]; then
+    local pw otp
+    if ! pw="$(secret_get password)" || [ -z "$pw" ]; then
         log "Failed to retrieve a usable VPN password from the secret store ($SECRET_BACKEND_RESOLVED:$SECRET_SERVICE)"
         return 1
     fi
+    # If a TOTP seed is stored, append a freshly generated 6-digit code to the
+    # password (e.g. RADIUS/2FA gateways that want password+OTP concatenated).
+    # Generated here — i.e. right before every launch, not once at monitor
+    # start — since codes rotate every 30s and a reconnect can happen much
+    # later than startup.
+    if secret_present otp; then
+        if ! otp="$(otp_now)" || [ -z "$otp" ]; then
+            log "Failed to generate a TOTP code (check 'oathtool' is installed and the stored secret is valid)"
+            return 1
+        fi
+        pw="${pw}${OTP_SEPARATOR}${otp}"
+    fi
     # Exported so fortiVPN.expect reads it from the environment, never argv,
-    # keeping it out of `ps`.
+    # keeping it out of `ps`. Also used directly for the openvpn auth file.
     export VPN_PASSWORD="$pw"
 }
 
 launch_tunnel() {
+    if ! load_credentials; then
+        log "Skipping launch: no usable credentials"
+        return 1
+    fi
+    case "$VPN_TYPE" in
+        openvpn) launch_openvpn ;;
+        *)       launch_fortivpn ;;
+    esac
+}
+
+launch_fortivpn() {
     "$EXPECT_SCRIPT" "$OPENFORTIVPN" "$CONFIG_PATH" >> "$LOG_FILE" 2>&1 &
     TUNNEL_PID=$!
-    log "Launched tunnel (expect pid $TUNNEL_PID)"
+    log "Launched fortivpn tunnel (expect pid $TUNNEL_PID)"
+}
+
+launch_openvpn() {
+    # Fresh auth-user-pass file each launch: username then password, owner-only.
+    # Kept out of argv (never in `ps`) and at a fixed path so it can be named
+    # exactly in the generated sudoers rule.
+    : > "$OPENVPN_AUTH_FILE"
+    chmod 600 "$OPENVPN_AUTH_FILE" 2>/dev/null
+    { printf '%s\n' "$OPENVPN_USERNAME"; printf '%s\n' "$VPN_PASSWORD"; } > "$OPENVPN_AUTH_FILE"
+    sudo -n "$OPENVPN" --config "$OPENVPN_CONFIG_PATH" --auth-user-pass "$OPENVPN_AUTH_FILE" \
+        >> "$LOG_FILE" 2>&1 &
+    TUNNEL_PID=$!
+    log "Launched openvpn tunnel (pid $TUNNEL_PID)"
 }
 
 # Used by the backgrounded monitor: never prompts (sudo -n), so it can't hang.
@@ -280,7 +424,7 @@ teardown_tunnel() {
     fi
     TUNNEL_PID=""
     if tunnel_running; then
-        sudo -n "$PKILL" -f "$CONFIG_PATH" 2>/dev/null
+        sudo -n "$PKILL" -f "$ACTIVE_CONFIG" 2>/dev/null
     fi
 }
 
@@ -290,11 +434,15 @@ teardown_tunnel() {
 run_monitor() {
     trap 'log "Stop signal received — tearing down"; teardown_tunnel; rm -f "$PID_FILE"; exit 0' TERM INT
 
-    if [ -z "$OPENFORTIVPN" ]; then
-        log "Exiting: openfortivpn not found"; rm -f "$PID_FILE"; exit 1
+    if [ -z "$ACTIVE_BIN" ]; then
+        log "Exiting: $VPN_TYPE binary not found"; rm -f "$PID_FILE"; exit 1
     fi
-    if ! load_credentials; then
-        log "Exiting: no usable credentials"; rm -f "$PID_FILE"; exit 1
+    if [ "$VPN_TYPE" = "openvpn" ] && [ -z "$OPENVPN_USERNAME" ]; then
+        log "Exiting: OPENVPN_USERNAME not set"; rm -f "$PID_FILE"; exit 1
+    fi
+    if ! secret_present password; then
+        log "Exiting: no VPN password in the secret store ($SECRET_BACKEND_RESOLVED:$SECRET_SERVICE)"
+        rm -f "$PID_FILE"; exit 1
     fi
 
     local streak=0
@@ -309,10 +457,10 @@ run_monitor() {
             streak=0
             sleep "$CONNECT_GRACE"
         else
-            # Process alive but no ppp interface: still connecting or half-open.
+            # Process alive but no tunnel interface: still connecting or half-open.
             streak=$((streak + 1))
             if [ "$streak" -ge "$HALF_OPEN_CHECKS" ]; then
-                log "Tunnel half-open ($streak checks, no ppp) — reconnecting"
+                log "Tunnel half-open ($streak checks, no tunnel interface) — reconnecting"
                 teardown_tunnel
                 launch_tunnel
                 streak=0
@@ -333,15 +481,21 @@ do_start() {
         return 0
     fi
     require_config || return 1
-    if [ -z "$OPENFORTIVPN" ]; then
-        echo "Error: openfortivpn not found. Install it, or set OPENFORTIVPN in $SETTINGS_FILE." >&2
+    if [ -z "$ACTIVE_BIN" ]; then
+        local var_name="OPENFORTIVPN"
+        [ "$VPN_TYPE" = "openvpn" ] && var_name="OPENVPN"
+        echo "Error: $VPN_TYPE binary not found. Install it, or set $var_name in $SETTINGS_FILE." >&2
         return 1
     fi
-    if [ -z "$EXPECT_SCRIPT" ]; then
+    if [ "$VPN_TYPE" = "fortivpn" ] && [ -z "$EXPECT_SCRIPT" ]; then
         echo "Error: fortiVPN.expect helper not found near $SCRIPT_DIR." >&2
         return 1
     fi
-    if ! sudo_has_nopasswd "$OPENFORTIVPN -c $CONFIG_PATH"; then
+    if [ "$VPN_TYPE" = "openvpn" ] && [ -z "$OPENVPN_USERNAME" ]; then
+        echo "Error: OPENVPN_USERNAME not set. Set it in $SETTINGS_FILE (or re-run: $PROG setup)." >&2
+        return 1
+    fi
+    if ! sudo_has_nopasswd "$ACTIVE_LAUNCH_CMD"; then
         echo "Error: passwordless sudo is not configured for this exact command." >&2
         echo "Run: $PROG install-sudoers   (or: $PROG setup)" >&2
         return 1
@@ -372,7 +526,7 @@ do_stop() {
     # Fallback in case the monitor died uncleanly and left the tunnel up.
     if tunnel_running; then
         echo "Tearing down tunnel (may prompt for sudo password)..."
-        sudo "$PKILL" -f "$CONFIG_PATH" 2>/dev/null
+        sudo "$PKILL" -f "$ACTIVE_CONFIG" 2>/dev/null
     fi
 }
 
@@ -390,19 +544,19 @@ do_status() {
         echo "Monitor: stopped"
     fi
 
-    if inet="$(ppp_inet)"; then
-        echo "Tunnel:  connected ($inet)"
+    if inet="$(vpn_inet)"; then
+        echo "Tunnel:  connected ($inet) [$VPN_TYPE]"
     elif tunnel_running; then
-        echo "Tunnel:  connecting (process up, no ppp interface yet)"
+        echo "Tunnel:  connecting (process up, no tunnel interface yet) [$VPN_TYPE]"
     else
-        echo "Tunnel:  disconnected"
+        echo "Tunnel:  disconnected [$VPN_TYPE]"
     fi
 }
 
 do_routes() {
     local inet iface def_if count
-    if ! inet="$(ppp_inet)"; then
-        echo "Tunnel: disconnected — no ppp interface is up, so there are no VPN routes."
+    if ! inet="$(vpn_inet)"; then
+        echo "Tunnel: disconnected — no tunnel interface is up, so there are no VPN routes."
         return 1
     fi
     iface="${inet%% *}"
@@ -459,59 +613,94 @@ do_doctor() {
     echo "vpnctl diagnostics:"
     echo
     report info "OS: $OS    user: $USER"
+    report info "backend: $VPN_TYPE   (set VPN_TYPE=fortivpn|openvpn in $SETTINGS_FILE)"
     report info "config dir: $CONFIG_DIR"
     report info "state dir:  $STATE_DIR"
     echo
 
-    if [ -n "$OPENFORTIVPN" ] && [ -x "$OPENFORTIVPN" ]; then
-        report ok "openfortivpn found ($OPENFORTIVPN)"
-    else
-        report fail "openfortivpn not found — install it (brew/apt) or set OPENFORTIVPN in $SETTINGS_FILE"
-    fi
+    if [ "$VPN_TYPE" = "openvpn" ]; then
+        if [ -n "$OPENVPN" ] && [ -x "$OPENVPN" ]; then
+            report ok "openvpn found ($OPENVPN)"
+        else
+            report fail "openvpn not found — install it (brew/apt) or set OPENVPN in $SETTINGS_FILE"
+        fi
 
-    if [ -n "$EXPECT_SCRIPT" ] && [ -x "$EXPECT_SCRIPT" ]; then
-        report ok "expect helper present ($EXPECT_SCRIPT)"
-    elif [ -n "$EXPECT_SCRIPT" ]; then
-        report fail "expect helper present but not executable: $EXPECT_SCRIPT"
-    else
-        report fail "expect helper not found near $SCRIPT_DIR"
-    fi
-
-    if command -v expect >/dev/null 2>&1; then
-        report ok "'expect' interpreter installed"
-    else
-        report fail "'expect' interpreter missing — install it (brew install expect / apt install expect)"
-    fi
-
-    if [ -r "$CONFIG_PATH" ]; then
-        if grep -q '^[[:space:]]*host' "$CONFIG_PATH" && grep -q '^[[:space:]]*trusted-cert' "$CONFIG_PATH"; then
-            if grep -q 'REPLACE_WITH_GATEWAY_CERT_SHA256' "$CONFIG_PATH"; then
-                report warn "config present but trusted-cert is still the placeholder ($CONFIG_PATH)"
+        if [ -r "$OPENVPN_CONFIG_PATH" ]; then
+            if grep -qE '^[[:space:]]*(client|remote)[[:space:]]' "$OPENVPN_CONFIG_PATH"; then
+                report ok "config readable with client/remote directives ($OPENVPN_CONFIG_PATH)"
             else
-                report ok "config readable with host + trusted-cert ($CONFIG_PATH)"
+                report fail "config $OPENVPN_CONFIG_PATH is missing 'client'/'remote' directives"
             fi
         else
-            report fail "config $CONFIG_PATH is missing a host or trusted-cert line"
+            report fail "no config at $OPENVPN_CONFIG_PATH — run: $PROG setup"
+        fi
+
+        if [ -n "$OPENVPN_USERNAME" ]; then
+            report ok "OPENVPN_USERNAME set ($OPENVPN_USERNAME)"
+        else
+            report fail "OPENVPN_USERNAME not set — set it in $SETTINGS_FILE (or run: $PROG setup)"
         fi
     else
-        report fail "no config at $CONFIG_PATH — run: $PROG setup"
+        if [ -n "$OPENFORTIVPN" ] && [ -x "$OPENFORTIVPN" ]; then
+            report ok "openfortivpn found ($OPENFORTIVPN)"
+        else
+            report fail "openfortivpn not found — install it (brew/apt) or set OPENFORTIVPN in $SETTINGS_FILE"
+        fi
+
+        if [ -n "$EXPECT_SCRIPT" ] && [ -x "$EXPECT_SCRIPT" ]; then
+            report ok "expect helper present ($EXPECT_SCRIPT)"
+        elif [ -n "$EXPECT_SCRIPT" ]; then
+            report fail "expect helper present but not executable: $EXPECT_SCRIPT"
+        else
+            report fail "expect helper not found near $SCRIPT_DIR"
+        fi
+
+        if command -v expect >/dev/null 2>&1; then
+            report ok "'expect' interpreter installed"
+        else
+            report fail "'expect' interpreter missing — install it (brew install expect / apt install expect)"
+        fi
+
+        if [ -r "$CONFIG_PATH" ]; then
+            if grep -q '^[[:space:]]*host' "$CONFIG_PATH" && grep -q '^[[:space:]]*trusted-cert' "$CONFIG_PATH"; then
+                if grep -q 'REPLACE_WITH_GATEWAY_CERT_SHA256' "$CONFIG_PATH"; then
+                    report warn "config present but trusted-cert is still the placeholder ($CONFIG_PATH)"
+                else
+                    report ok "config readable with host + trusted-cert ($CONFIG_PATH)"
+                fi
+            else
+                report fail "config $CONFIG_PATH is missing a host or trusted-cert line"
+            fi
+        else
+            report fail "no config at $CONFIG_PATH — run: $PROG setup"
+        fi
     fi
 
     if [ -z "$SECRET_BACKEND_RESOLVED" ]; then
         report fail "no secret backend available — need 'security' (macOS), 'secret-tool', or 'pass'"
-    elif secret_present; then
+    elif secret_present password; then
         report ok "VPN password stored (backend: $SECRET_BACKEND_RESOLVED, service: $SECRET_SERVICE)"
     else
         report fail "no VPN password in $SECRET_BACKEND_RESOLVED (service: $SECRET_SERVICE) — run: $PROG set-password"
     fi
 
-    if [ -n "$OPENFORTIVPN" ] && sudo_has_nopasswd "$OPENFORTIVPN -c $CONFIG_PATH"; then
-        report ok "passwordless sudo for the openfortivpn launch command"
+    if secret_present otp; then
+        if command -v oathtool >/dev/null 2>&1; then
+            report ok "TOTP secret stored — a fresh 6-digit code is appended to the password each connect"
+        else
+            report fail "TOTP secret stored but 'oathtool' is missing — install it (brew install oath-toolkit / apt install oathtool)"
+        fi
     else
-        report fail "passwordless sudo for openfortivpn missing/mismatched — run: $PROG install-sudoers"
+        report info "no TOTP secret configured (only needed for password+OTP gateways — set with: $PROG set-otp-secret)"
     fi
 
-    if sudo_has_nopasswd "$PKILL -f $CONFIG_PATH"; then
+    if [ -n "$ACTIVE_BIN" ] && sudo_has_nopasswd "$ACTIVE_LAUNCH_CMD"; then
+        report ok "passwordless sudo for the $VPN_TYPE launch command"
+    else
+        report fail "passwordless sudo for $VPN_TYPE missing/mismatched — run: $PROG install-sudoers"
+    fi
+
+    if sudo_has_nopasswd "$PKILL -f $ACTIVE_CONFIG"; then
         report ok "passwordless sudo for tunnel teardown (pkill)"
     else
         report fail "passwordless sudo for pkill missing — half-open recovery will need a password (run: $PROG install-sudoers)"
@@ -523,10 +712,10 @@ do_doctor() {
     else
         report info "monitor not running"
     fi
-    if inet="$(ppp_inet)"; then
+    if inet="$(vpn_inet)"; then
         report info "tunnel connected ($inet)"
     elif tunnel_running; then
-        report info "tunnel connecting (process up, no ppp interface yet)"
+        report info "tunnel connecting (process up, no tunnel interface yet)"
     else
         report info "tunnel disconnected"
     fi
@@ -574,13 +763,66 @@ do_set_password() {
     fi
 }
 
-# Set/replace a "key = value" line in the config (append if absent).
-# Pure-bash rewrite (no sed/awk), so values containing &, |, \, etc. stay
-# literal instead of being interpreted as replacement syntax or a delimiter.
-conf_set() {
-    local key="$1" val="$2" tmp line found=0
-    tmp="$(mktemp "${TMPDIR:-/tmp}/vpncli.conf.XXXXXX")" || return 1
-    if [ -f "$CONFIG_PATH" ]; then
+do_set_otp_secret() {
+    local seed tries
+    if [ -z "$SECRET_BACKEND_RESOLVED" ]; then
+        echo "Error: no secret backend available (need 'security', 'secret-tool', or 'pass')." >&2
+        return 1
+    fi
+    echo "Enter the TOTP *secret/seed* — the base32 string from your authenticator"
+    echo "enrollment (often labeled 'secret key', shown next to the QR code)."
+    echo "This is NOT a 6-digit code; it's the long string used to generate them."
+    echo "Once stored, vpnctl appends a freshly generated 6-digit code to your"
+    echo "password on every connection attempt automatically."
+    echo
+    tries=0
+    while :; do
+        tries=$((tries + 1))
+        printf 'TOTP secret (blank to cancel): '
+        read -rs seed; echo
+        if [ -z "$seed" ]; then
+            echo "Cancelled."; return 1
+        fi
+        # base32 secrets are commonly copy-pasted with spaces; strip them.
+        seed="$(printf '%s' "$seed" | tr -d '[:space:]')"
+        if command -v oathtool >/dev/null 2>&1 && ! oathtool --totp -b "$seed" >/dev/null 2>&1; then
+            echo "That doesn't look like a valid base32 TOTP secret." >&2
+        else
+            break
+        fi
+        if [ "$tries" -ge 3 ]; then
+            echo "Aborted after 3 attempts." >&2; return 1
+        fi
+        echo "Try again." >&2
+    done
+
+    if secret_set "$seed" otp; then
+        echo "Stored TOTP secret (backend: $SECRET_BACKEND_RESOLVED, service: $SECRET_SERVICE)."
+        echo "Verify with: $PROG doctor"
+    else
+        echo "Failed to store TOTP secret in the secret store." >&2; return 1
+    fi
+}
+
+do_unset_otp_secret() {
+    if ! secret_present otp; then
+        echo "No TOTP secret is stored."
+        return 0
+    fi
+    if secret_delete otp; then
+        echo "Removed TOTP secret. Passwords will no longer get a code appended."
+    else
+        echo "Failed to remove TOTP secret." >&2; return 1
+    fi
+}
+
+# Set/replace a "key = value" line in a file (append if absent). Pure-bash
+# rewrite (no sed/awk), so values containing &, |, \, etc. stay literal
+# instead of being interpreted as replacement syntax or a delimiter.
+file_kv_set() {
+    local file="$1" key="$2" val="$3" tmp line found=0
+    tmp="$(mktemp "${TMPDIR:-/tmp}/vpncli.kv.XXXXXX")" || return 1
+    if [ -f "$file" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
             if [ "$found" -eq 0 ] && [[ "$line" =~ ^[[:space:]]*"$key"[[:space:]]*= ]]; then
                 printf '%s = %s\n' "$key" "$val"
@@ -588,12 +830,40 @@ conf_set() {
             else
                 printf '%s\n' "$line"
             fi
-        done < "$CONFIG_PATH" > "$tmp"
+        done < "$file" > "$tmp"
     fi
     if [ "$found" -eq 0 ]; then
         printf '%s = %s\n' "$key" "$val" >> "$tmp"
     fi
-    mv "$tmp" "$CONFIG_PATH"
+    mv "$tmp" "$file"
+}
+
+conf_set() {
+    file_kv_set "$CONFIG_PATH" "$1" "$2"
+}
+
+# Set/replace a shell-style "KEY=value" assignment in $SETTINGS_FILE (append if
+# absent). Used to persist non-secret, per-machine tunables like VPN_TYPE and
+# OPENVPN_USERNAME outside of code, same as every other setting.
+settings_set() {
+    local key="$1" val="$2" tmp line found=0
+    mkdir -p "$CONFIG_DIR" 2>/dev/null
+    tmp="$(mktemp "${TMPDIR:-/tmp}/vpncli.settings.XXXXXX")" || return 1
+    if [ -f "$SETTINGS_FILE" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            if [ "$found" -eq 0 ] && [[ "$line" =~ ^[[:space:]]*"$key"= ]]; then
+                printf '%s=%q\n' "$key" "$val"
+                found=1
+            else
+                printf '%s\n' "$line"
+            fi
+        done < "$SETTINGS_FILE" > "$tmp"
+    fi
+    if [ "$found" -eq 0 ]; then
+        printf '%s=%q\n' "$key" "$val" >> "$tmp"
+    fi
+    mv "$tmp" "$SETTINGS_FILE"
+    chmod 600 "$SETTINGS_FILE" 2>/dev/null
 }
 
 prompt_config() {
@@ -610,46 +880,101 @@ prompt_config() {
     echo "Paste it into the 'trusted-cert =' line of $CONFIG_PATH before connecting."
 }
 
+prompt_openvpn_config() {
+    local user
+    echo "Replace $OPENVPN_CONFIG_PATH with your provider's .ovpn client config"
+    echo "(certs/keys embedded inline, or as absolute paths — it runs as root)."
+    printf '  Username (auth-user-pass): '; read -r user
+    if [ -n "$user" ]; then
+        settings_set OPENVPN_USERNAME "$user"
+        OPENVPN_USERNAME="$user"
+    fi
+}
+
 do_install_sudoers() {
     local tmpl tmp _p
-    tmpl="$(find_asset vpncli.sudoers.template)" || {
-        echo "Error: sudoers template not found near $SCRIPT_DIR." >&2; return 1; }
-    if [ -z "$OPENFORTIVPN" ]; then
-        echo "Error: openfortivpn not found; set OPENFORTIVPN in $SETTINGS_FILE first." >&2; return 1
+    if [ -z "$ACTIVE_BIN" ]; then
+        local var_name="OPENFORTIVPN"
+        [ "$VPN_TYPE" = "openvpn" ] && var_name="OPENVPN"
+        echo "Error: $VPN_TYPE binary not found; set $var_name in $SETTINGS_FILE first." >&2
+        return 1
     fi
     require_config || return 1
 
-    # sudo matches the rule as a literal, whitespace-delimited command line, so a
-    # space anywhere in these paths would silently break passwordless matching
-    # (and teardown). Fail early with guidance instead.
-    for _p in "$OPENFORTIVPN" "$CONFIG_PATH" "$PKILL"; do
-        case "$_p" in
-            *[[:space:]]*)
-                echo "Error: this path contains whitespace, which breaks passwordless-sudo matching:" >&2
-                echo "  $_p" >&2
-                echo "Use a space-free location (e.g. set VPNCLI_CONFIG_DIR) and retry." >&2
-                return 1 ;;
-        esac
-    done
+    if [ "$VPN_TYPE" = "openvpn" ]; then
+        tmpl="$(find_asset vpncli-openvpn.sudoers.template)" || {
+            echo "Error: openvpn sudoers template not found near $SCRIPT_DIR." >&2; return 1; }
 
-    tmp="$(mktemp "${TMPDIR:-/tmp}/vpncli.sudoers.XXXXXX")" || return 1
-    sed -e "s|__USER__|$USER|g" \
-        -e "s|__OPENFORTIVPN__|$OPENFORTIVPN|g" \
-        -e "s|__CONFIG__|$CONFIG_PATH|g" \
-        -e "s|__PKILL__|$PKILL|g" \
-        "$tmpl" > "$tmp"
+        for _p in "$OPENVPN" "$OPENVPN_CONFIG_PATH" "$OPENVPN_AUTH_FILE" "$PKILL"; do
+            case "$_p" in
+                *[[:space:]]*)
+                    echo "Error: this path contains whitespace, which breaks passwordless-sudo matching:" >&2
+                    echo "  $_p" >&2
+                    echo "Use a space-free location (e.g. set VPNCLI_CONFIG_DIR/VPNCLI_STATE_DIR) and retry." >&2
+                    return 1 ;;
+            esac
+        done
 
-    if ! visudo -cf "$tmp" >/dev/null 2>&1; then
-        echo "Error: generated sudoers failed validation:" >&2
-        visudo -cf "$tmp" >&2
-        rm -f "$tmp"; return 1
+        # Auth file must exist for visudo's own sanity, and to be a stable target;
+        # actual contents are (re)written fresh on every launch.
+        mkdir -p "$STATE_DIR"
+        [ -f "$OPENVPN_AUTH_FILE" ] || : > "$OPENVPN_AUTH_FILE"
+        chmod 600 "$OPENVPN_AUTH_FILE" 2>/dev/null
+
+        tmp="$(mktemp "${TMPDIR:-/tmp}/vpncli.sudoers.XXXXXX")" || return 1
+        sed -e "s|__USER__|$USER|g" \
+            -e "s|__OPENVPN__|$OPENVPN|g" \
+            -e "s|__OVPN_CONFIG__|$OPENVPN_CONFIG_PATH|g" \
+            -e "s|__AUTH_FILE__|$OPENVPN_AUTH_FILE|g" \
+            -e "s|__PKILL__|$PKILL|g" \
+            "$tmpl" > "$tmp"
+
+        if ! visudo -cf "$tmp" >/dev/null 2>&1; then
+            echo "Error: generated sudoers failed validation:" >&2
+            visudo -cf "$tmp" >&2
+            rm -f "$tmp"; return 1
+        fi
+
+        echo "Installing passwordless-sudo rule to $SUDOERS_PATH (requires sudo):"
+        echo "  user:    $USER"
+        echo "  openvpn: $OPENVPN"
+        echo "  config:  $OPENVPN_CONFIG_PATH"
+        echo "  auth:    $OPENVPN_AUTH_FILE"
+        echo "  pkill:   $PKILL"
+    else
+        tmpl="$(find_asset vpncli.sudoers.template)" || {
+            echo "Error: sudoers template not found near $SCRIPT_DIR." >&2; return 1; }
+
+        for _p in "$OPENFORTIVPN" "$CONFIG_PATH" "$PKILL"; do
+            case "$_p" in
+                *[[:space:]]*)
+                    echo "Error: this path contains whitespace, which breaks passwordless-sudo matching:" >&2
+                    echo "  $_p" >&2
+                    echo "Use a space-free location (e.g. set VPNCLI_CONFIG_DIR) and retry." >&2
+                    return 1 ;;
+            esac
+        done
+
+        tmp="$(mktemp "${TMPDIR:-/tmp}/vpncli.sudoers.XXXXXX")" || return 1
+        sed -e "s|__USER__|$USER|g" \
+            -e "s|__OPENFORTIVPN__|$OPENFORTIVPN|g" \
+            -e "s|__CONFIG__|$CONFIG_PATH|g" \
+            -e "s|__PKILL__|$PKILL|g" \
+            "$tmpl" > "$tmp"
+
+        if ! visudo -cf "$tmp" >/dev/null 2>&1; then
+            echo "Error: generated sudoers failed validation:" >&2
+            visudo -cf "$tmp" >&2
+            rm -f "$tmp"; return 1
+        fi
+
+        echo "Installing passwordless-sudo rule to $SUDOERS_PATH (requires sudo):"
+        echo "  user:         $USER"
+        echo "  openfortivpn: $OPENFORTIVPN"
+        echo "  config:       $CONFIG_PATH"
+        echo "  pkill:        $PKILL"
     fi
 
-    echo "Installing passwordless-sudo rule to $SUDOERS_PATH (requires sudo):"
-    echo "  user:         $USER"
-    echo "  openfortivpn: $OPENFORTIVPN"
-    echo "  config:       $CONFIG_PATH"
-    echo "  pkill:        $PKILL"
     if sudo install -m 0440 "$tmp" "$SUDOERS_PATH"; then
         rm -f "$tmp"
         echo "Installed. Verify with: $PROG doctor"
@@ -675,45 +1000,88 @@ do_setup() {
     mkdir -p "$CONFIG_DIR" "$STATE_DIR"
     chmod 700 "$CONFIG_DIR" "$STATE_DIR" 2>/dev/null   # tighten if dirs pre-existed
 
-    # 1. Config
-    if [ -r "$CONFIG_PATH" ]; then
-        echo "Config already present: $CONFIG_PATH"
+    # 0. Backend
+    echo "VPN backend (currently: $VPN_TYPE):"
+    printf '  [1] fortivpn (openfortivpn)   [2] openvpn   [Enter = keep current] '
+    read -r ans
+    case "$ans" in
+        1) VPN_TYPE="fortivpn"; settings_set VPN_TYPE fortivpn ;;
+        2) VPN_TYPE="openvpn";  settings_set VPN_TYPE openvpn ;;
+        *) ;;
+    esac
+    # Re-resolve the active binary/config for the (possibly just-changed) backend.
+    if [ "$VPN_TYPE" = "openvpn" ]; then
+        [ -z "$OPENVPN" ] && OPENVPN="$(detect_openvpn || true)"
+        ACTIVE_BIN="$OPENVPN"; ACTIVE_CONFIG="$OPENVPN_CONFIG_PATH"
     else
-        # Only consider configs tied to the install/clone location — never the
-        # current directory, so running setup elsewhere can't import a stray
-        # vpn.conf. Confirm before importing so it's never a surprise.
-        imported=""
-        cand=""
-        for c in "$SCRIPT_DIR/../vpn.conf" "$SCRIPT_DIR/vpn.conf"; do
-            if [ -r "$c" ] && [ "$c" != "$CONFIG_PATH" ]; then cand="$c"; break; fi
-        done
-        if [ -n "$cand" ]; then
-            printf 'Found an existing config at %s\n' "$cand"
-            printf 'Import it into %s? [Y/n] ' "$CONFIG_PATH"
-            read -r ans
-            case "$ans" in
-                [Nn]*) ;;
-                *)     cp "$cand" "$CONFIG_PATH" && imported="$cand" ;;
-            esac
-        fi
-        if [ -n "$imported" ]; then
-            echo "Imported existing config: $imported → $CONFIG_PATH"
-        else
-            ex="$(find_asset vpn.conf.example)" && cp "$ex" "$CONFIG_PATH"
-            echo "Created config from template: $CONFIG_PATH"
-            prompt_config
-        fi
+        [ -z "$OPENFORTIVPN" ] && OPENFORTIVPN="$(detect_openfortivpn || true)"
+        ACTIVE_BIN="$OPENFORTIVPN"; ACTIVE_CONFIG="$CONFIG_PATH"
     fi
-    chmod 600 "$CONFIG_PATH" 2>/dev/null
+    echo
+
+    # 1. Config
+    if [ "$VPN_TYPE" = "openvpn" ]; then
+        if [ -r "$OPENVPN_CONFIG_PATH" ]; then
+            echo "Config already present: $OPENVPN_CONFIG_PATH"
+            if [ -z "$OPENVPN_USERNAME" ]; then prompt_openvpn_config; fi
+        else
+            ex="$(find_asset vpn.ovpn.example)" && cp "$ex" "$OPENVPN_CONFIG_PATH"
+            echo "Created config from template: $OPENVPN_CONFIG_PATH"
+            prompt_openvpn_config
+        fi
+        chmod 600 "$OPENVPN_CONFIG_PATH" 2>/dev/null
+    else
+        if [ -r "$CONFIG_PATH" ]; then
+            echo "Config already present: $CONFIG_PATH"
+        else
+            # Only consider configs tied to the install/clone location — never the
+            # current directory, so running setup elsewhere can't import a stray
+            # vpn.conf. Confirm before importing so it's never a surprise.
+            imported=""
+            cand=""
+            for c in "$SCRIPT_DIR/../vpn.conf" "$SCRIPT_DIR/vpn.conf"; do
+                if [ -r "$c" ] && [ "$c" != "$CONFIG_PATH" ]; then cand="$c"; break; fi
+            done
+            if [ -n "$cand" ]; then
+                printf 'Found an existing config at %s\n' "$cand"
+                printf 'Import it into %s? [Y/n] ' "$CONFIG_PATH"
+                read -r ans
+                case "$ans" in
+                    [Nn]*) ;;
+                    *)     cp "$cand" "$CONFIG_PATH" && imported="$cand" ;;
+                esac
+            fi
+            if [ -n "$imported" ]; then
+                echo "Imported existing config: $imported → $CONFIG_PATH"
+            else
+                ex="$(find_asset vpn.conf.example)" && cp "$ex" "$CONFIG_PATH"
+                echo "Created config from template: $CONFIG_PATH"
+                prompt_config
+            fi
+        fi
+        chmod 600 "$CONFIG_PATH" 2>/dev/null
+    fi
     echo
 
     # 2. Password
-    if secret_present; then
+    if secret_present password; then
         echo "VPN password already stored (service: $SECRET_SERVICE)."
         printf 'Re-enter it? [y/N] '; read -r ans
         case "$ans" in [Yy]*) do_set_password ;; esac
     else
         do_set_password
+    fi
+    echo
+
+    # 2b. Optional TOTP (for gateways that want password+OTP concatenated)
+    if secret_present otp; then
+        echo "TOTP secret already stored — a code is appended to the password on connect."
+        printf 'Re-enter it? [y/N] '; read -r ans
+        case "$ans" in [Yy]*) do_set_otp_secret ;; esac
+    else
+        printf 'Does this VPN require a 6-digit OTP appended to the password? [y/N] '
+        read -r ans
+        case "$ans" in [Yy]*) do_set_otp_secret ;; esac
     fi
     echo
 
@@ -730,8 +1098,25 @@ do_setup() {
 # ===========================================================================
 PKILL="$(command -v pkill 2>/dev/null || echo /usr/bin/pkill)"
 [ -z "$OPENFORTIVPN" ] && OPENFORTIVPN="$(detect_openfortivpn || true)"
+[ -z "$OPENVPN" ]      && OPENVPN="$(detect_openvpn || true)"
 EXPECT_SCRIPT="$(find_asset fortiVPN.expect || true)"
 SECRET_BACKEND_RESOLVED="$(resolve_secret_backend || true)"
+
+# Active backend selection: everything else (tunnel_running, teardown, doctor,
+# sudoers) keys off ACTIVE_BIN/ACTIVE_CONFIG/ACTIVE_LAUNCH_CMD rather than
+# branching on VPN_TYPE everywhere.
+case "$VPN_TYPE" in
+    openvpn)
+        ACTIVE_BIN="$OPENVPN"
+        ACTIVE_CONFIG="$OPENVPN_CONFIG_PATH"
+        ACTIVE_LAUNCH_CMD="$OPENVPN --config $OPENVPN_CONFIG_PATH --auth-user-pass $OPENVPN_AUTH_FILE"
+        ;;
+    *)
+        ACTIVE_BIN="$OPENFORTIVPN"
+        ACTIVE_CONFIG="$CONFIG_PATH"
+        ACTIVE_LAUNCH_CMD="$OPENFORTIVPN -c $CONFIG_PATH"
+        ;;
+esac
 
 case "${1:-}" in
     start)             do_start ;;
@@ -743,6 +1128,8 @@ case "${1:-}" in
     doctor)            do_doctor ;;
     setup)             do_setup ;;
     set-password)      do_set_password ;;
+    set-otp-secret)    do_set_otp_secret ;;
+    unset-otp-secret)  do_unset_otp_secret ;;
     install-sudoers)   do_install_sudoers ;;
     uninstall-sudoers) do_uninstall_sudoers ;;
     __run__)           run_monitor ;;

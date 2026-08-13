@@ -1,5 +1,5 @@
 class Vpncli < Formula
-  desc "Self-supervising openfortivpn VPN tunnel manager (CLI + monitor daemon)"
+  desc "Self-supervising VPN tunnel manager for openfortivpn or OpenVPN (CLI + monitor daemon)"
   homepage "https://github.com/010228lxz/vpncli"
   url "https://github.com/010228lxz/vpncli/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "647dc2557a97e29130fb1ef066ab77e0abcbe4773f9f1c3cc04884ec0519c83f"
@@ -13,7 +13,8 @@ class Vpncli < Formula
   def install
     bin.install "bin/vpnctl"
     libexec.install "libexec/fortiVPN.expect"
-    pkgshare.install "share/vpn.conf.example", "share/vpncli.sudoers.template"
+    pkgshare.install "share/vpn.conf.example", "share/vpn.ovpn.example",
+                      "share/vpncli.sudoers.template", "share/vpncli-openvpn.sudoers.template"
   end
 
   def caveats
@@ -24,7 +25,13 @@ class Vpncli < Formula
         vpnctl setup
 
       That creates the config, stores your VPN password, and installs the
-      passwordless-sudo rule scoped to your exact openfortivpn command.
+      passwordless-sudo rule scoped to your exact launch command.
+
+      Two backends are supported, chosen via VPN_TYPE in
+      ~/.config/vpncli/settings (default: fortivpn):
+        - fortivpn: needs `openfortivpn` (installed as a dependency above).
+        - openvpn:  needs `openvpn` too — install it yourself:
+                      brew install openvpn
 
       Config lives in ~/.config/vpncli/ and logs/pid in ~/.local/state/vpncli/.
     EOS

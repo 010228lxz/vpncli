@@ -1,0 +1,46 @@
+# openvpn client configuration — template.
+#
+# This is NOT meant to be filled in like vpn.conf: a real .ovpn file normally
+# comes from your VPN provider/admin, with the `remote`, `proto`, `cipher`,
+# and certificate/key material specific to their server. Replace this whole
+# file with theirs at:
+#   ~/.config/vpncli/vpn.ovpn            (or $VPNCLI_CONFIG_DIR/vpn.ovpn)
+# `vpnctl setup` (with VPN_TYPE=openvpn) copies this template there if no
+# config exists yet, and prompts for your auth-user-pass username.
+#
+# This file is also the process fingerprint: the monitor finds the running
+# tunnel with `pgrep -f <this file's path>`, so it must be a stable, unique
+# path — don't move VPNCLI_CONFIG_DIR while a tunnel is running.
+#
+# Username/password: vpnctl supplies these itself via a freshly generated
+# `--auth-user-pass <file>` on every launch (from the OS secret store), so do
+# NOT put `auth-user-pass` or an inline username/password in this file.
+
+client
+dev tun
+proto udp
+
+# Gateway host/IP and port.
+remote vpn.example.com 1194
+
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+
+# Certificate material: either reference absolute, whitespace-free paths...
+#   ca   /path/to/ca.crt
+#   cert /path/to/client.crt
+#   key  /path/to/client.key
+# ...or embed them inline (preferred — keeps everything in one file):
+#   <ca>
+#   -----BEGIN CERTIFICATE-----
+#   ...
+#   -----END CERTIFICATE-----
+#   </ca>
+
+remote-cert-tls server
+cipher AES-256-GCM
+auth SHA256
+verb 3
+
