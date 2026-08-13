@@ -17,13 +17,15 @@ bin/vpnctl setup            # first-run bootstrap: pick backend, config + passwo
 bin/vpnctl start            # spawn the background monitor (daemonizes itself)
 bin/vpnctl stop             # kill the monitor; its trap tears down the tunnel
 bin/vpnctl restart
+bin/vpnctl switch <backend> # switch VPN_TYPE at runtime (fortivpn|openvpn); seamless only once
+                             # the target backend's own config/password/sudoers are provisioned
 bin/vpnctl status           # monitor + tunnel state
 bin/vpnctl routes           # show VPN routes, and whether it's FULL or SPLIT tunnel
 bin/vpnctl logs [-f]        # tail the log (-f to follow)
 bin/vpnctl doctor           # diagnostics — run this first when anything is wrong
-bin/vpnctl set-password     # (re)store the VPN password in the OS secret store
-bin/vpnctl install-sudoers  # (re)render + install the passwordless-sudo rule
-bin/vpnctl uninstall-sudoers
+bin/vpnctl set-password     # (re)store the VPN password in the OS secret store (active backend only)
+bin/vpnctl install-sudoers  # (re)render + install the passwordless-sudo rule (active backend only)
+bin/vpnctl uninstall-sudoers [--all]
 ```
 
 (After `brew install` or a PATH symlink it's just `vpnctl`.) `doctor` is the primary
@@ -34,9 +36,13 @@ re-execs the script as `$SELF __run__` under `nohup` to become the monitor daemo
 ## Backend selection (`VPN_TYPE`)
 
 `VPN_TYPE` (`fortivpn` default, or `openvpn`) is a `settings`-file tunable, not a CLI flag —
-consistent with every other tunable (see Customization below). Nearly everything in `bin/vpnctl`
-that used to hardcode fortivpn-specific values now branches on `VPN_TYPE` or reads one of the
-**generic post-resolution variables** computed once near the bottom of the script:
+consistent with every other tunable (see Customization below); `do_switch` (subcommand `switch`)
+also flips it at runtime via `settings_set`, without the full `setup` wizard (see "Switching
+backends" below). Nearly everything in `bin/vpnctl` that used to hardcode fortivpn-specific values
+now branches on `VPN_TYPE` or reads one of the **generic post-resolution variables** computed by
+`resolve_active_backend`, a function (not an inline block, so `do_switch` can re-run it after
+flipping `VPN_TYPE` mid-process) called once near the bottom of the script and again inside
+`do_switch`/`do_setup`:
 
 - `ACTIVE_BIN` — the resolved binary for the active backend (`$OPENFORTIVPN` or `$OPENVPN`).
 - `ACTIVE_CONFIG` — the active backend's config file path (`$CONFIG_PATH` = `vpn.conf`, or
@@ -45,12 +51,41 @@ that used to hardcode fortivpn-specific values now branches on `VPN_TYPE` or rea
 - `ACTIVE_LAUNCH_CMD` — the exact literal command line sudo must grant NOPASSWD on (differs in
   shape per backend; see Security model). Used by `sudo_has_nopasswd` in both `do_start` and
   `do_doctor`.
+- `ACTIVE_SUDOERS_PATH` — `"${SUDOERS_PATH}-${VPN_TYPE}"`, e.g. `/etc/sudoers.d/vpncli-fortivpn`.
+  Suffixed per backend so both backends' passwordless-sudo rules can be installed and kept
+  simultaneously — this is the main enabler of a seamless `switch` (no re-prompting for sudo).
 
 `tunnel_running`, `teardown_tunnel`, `require_config`, `do_start`, `do_stop`, and `do_doctor` all
-key off these three instead of re-branching on `VPN_TYPE` themselves. Functions that *do* still
+key off these four instead of re-branching on `VPN_TYPE` themselves. Functions that *do* still
 branch explicitly on `VPN_TYPE`: `launch_tunnel` (dispatches to `launch_fortivpn`/`launch_openvpn`),
 `vpn_inet` (dispatches to `ppp_inet`/`tun_inet`), `do_install_sudoers` (different template/sed per
 backend), and `do_setup`/`do_doctor` (different config-file validation per backend).
+
+## Switching backends (`do_switch`, per-backend credential/sudoers scoping)
+
+`switch` is only *seamless* (no re-entered credentials, no fresh sudo prompt) because every
+backend-specific artifact is scoped independently and can coexist:
+
+- **Config**: already separate files (`vpn.conf` vs `vpn.ovpn` — pre-existing).
+- **Password / OTP seed**: `secret_account` folds `$VPN_TYPE` into the secret-store account name
+  (`${USER}-${VPN_TYPE}` / `${USER}-${VPN_TYPE}-totp`), so fortivpn and openvpn each get their own
+  entries — see "Password + OTP" below for why this specifically matters for OTP.
+- **Sudoers**: `ACTIVE_SUDOERS_PATH` suffixes the base `$SUDOERS_PATH` per backend, so
+  `install-sudoers` for one backend never overwrites/removes the other's rule file.
+
+`do_switch <target>`: validates `target` is `fortivpn`/`openvpn` and differs from the current
+`VPN_TYPE`; stops the monitor first if running (remembers this to restart it after); persists the
+new `VPN_TYPE` via `settings_set` and calls `resolve_active_backend` to recompute the `ACTIVE_*`
+vars in-process (no re-exec needed); then runs a lightweight readiness check (binary, config,
+`OPENVPN_USERNAME` if applicable, stored password, passwordless sudo) scoped to the *new* backend
+and reports exactly what's missing rather than failing silently or forcing `setup`. If everything
+is ready and the monitor was running before the switch, it calls `do_start` automatically.
+
+`do_setup`'s backend-selection step (`case "$ans" in 1|2|*)`) also calls `resolve_active_backend`
+after `settings_set VPN_TYPE`, instead of duplicating the resolution logic — keep both call sites
+using the shared function rather than re-inlining the `case "$VPN_TYPE" in openvpn|*)` branch.
+
+
 
 ## Architecture
 
@@ -110,12 +145,25 @@ Some gateways (FortiGate+RADIUS, corporate OpenVPN) require the static password 
 followed by a rotating 6-digit TOTP code, concatenated into one string. `secret_get`/
 `secret_set`/`secret_present`/`secret_delete` all take an optional **kind** argument (`password`
 default, or `otp`) that's resolved to a distinct secret-store *account* via `secret_account`
-(`$USER` vs `${USER}-totp`) — same `$SECRET_SERVICE`, different entry, so existing stored
-passwords are unaffected by this change. `otp_now` reads the `otp`-kind secret (the TOTP *seed*,
-never a code) and shells out to `oathtool --totp -b <seed>` to generate the current code.
+(`${USER}-${VPN_TYPE}` vs `${USER}-${VPN_TYPE}-totp`) — same `$SECRET_SERVICE`, different entry,
+and now scoped to the *active* `VPN_TYPE` too. This backend-scoping is what makes a
+password-only fortivpn + password+OTP openvpn setup (or vice versa) work correctly: `otp_now`/
+`load_credentials` only ever check `secret_present otp` for the *currently active* backend's
+account, so an OTP seed configured while `VPN_TYPE=openvpn` can never get appended to the
+fortivpn password after a `switch` — before this scoping existed, `secret_account` ignored
+`VPN_TYPE` entirely, so both backends shared one password entry and one OTP toggle.
+`secret_account_legacy` (`$USER` / `${USER}-totp`, backend-agnostic) is the pre-scoping account
+name; `secret_get` falls back to it when the per-backend account has nothing stored, so upgrading
+users don't lose an already-stored secret — `secret_set` always writes forward to the new
+per-backend account, migrating a backend onto its own entry the first time you re-run
+`set-password`/`set-otp-secret` while it's active. `secret_which_account` mirrors `secret_get`'s
+lookup/fallback order but returns which account actually resolved (used by `doctor`'s reporting,
+so it never claims a backend-scoped account is populated when the value is really still coming
+from the legacy shared one). `otp_now` reads the `otp`-kind secret (the TOTP *seed*, never a
+code) and shells out to `oathtool --totp -b <seed>` to generate the current code.
 `do_set_otp_secret`/`do_unset_otp_secret` (subcommands `set-otp-secret`/`unset-otp-secret`)
-manage the seed; it's validated with a real `oathtool` call before being stored if `oathtool` is
-present locally.
+manage the seed for the active backend; it's validated with a real `oathtool` call before being
+stored if `oathtool` is present locally.
 
 **Critical timing detail:** `load_credentials` (which builds `VPN_PASSWORD` = password +
 `OTP_SEPARATOR` + OTP code when an `otp` secret exists) is called **inside `launch_tunnel`**, not
@@ -155,19 +203,25 @@ platform-specific logic inside these helpers, not inline.
 
 The design keeps secrets out of `ps` and out of sudo prompts, for either backend:
 - The VPN password lives in the OS secret store under service `SECRET_SERVICE` (default
-  `vpncli`) — same store, same lookup, regardless of `VPN_TYPE`.
+  `vpncli`) — same store, same lookup mechanism, but a per-backend *account* (see "Password + OTP"
+  above and "Switching backends"): `VPN_TYPE` is folded into `secret_account`, so fortivpn and
+  openvpn never share a password/OTP entry.
   - **fortivpn**: exported as `VPN_PASSWORD` so `fortiVPN.expect` reads it from the environment,
     never from argv. **There is no `vpn_<password>` prefix hack** (the old design stripped a
     leading `login_` segment; the raw password is now stored and read verbatim).
   - **openvpn**: written by `launch_openvpn` to `$OPENVPN_AUTH_FILE` (username on line 1, password
     on line 2) immediately before every launch, `chmod 600`, and passed as
     `--auth-user-pass $OPENVPN_AUTH_FILE` — never appears on argv either.
-- **Passwordless sudo is generated per machine, never committed.** `do_install_sudoers` picks the
-  template/placeholders for the active `VPN_TYPE` and renders (fortivpn: user / openfortivpn path
-  / config path / pkill path; openvpn: user / openvpn path / `.ovpn` path / auth-file path / pkill
-  path), validates with `visudo -cf`, then `sudo install -m 0440`s it to `$SUDOERS_PATH`. Both the
-  launch and teardown (`pkill -f`) lines are rendered from the same paths the tool actually runs,
-  so they always match.
+- **Passwordless sudo is generated per machine, never committed, one rule file per backend.**
+  `do_install_sudoers` picks the template/placeholders for the active `VPN_TYPE` and renders
+  (fortivpn: user / openfortivpn path / config path / pkill path; openvpn: user / openvpn path /
+  `.ovpn` path / auth-file path / pkill path), validates with `visudo -cf`, then
+  `sudo install -m 0440`s it to `$ACTIVE_SUDOERS_PATH` (`"${SUDOERS_PATH}-${VPN_TYPE}"`) — never
+  the bare `$SUDOERS_PATH`, so installing one backend's rule can't clobber the other's file. Both
+  the launch and teardown (`pkill -f`) lines are rendered from the same paths the tool actually
+  runs, so they always match. `do_uninstall_sudoers` removes `$ACTIVE_SUDOERS_PATH` by default (or
+  the legacy unsuffixed `$SUDOERS_PATH` if that's what's present), and both backends' files plus
+  the legacy path with `--all`.
 - `teardown_tunnel` uses `sudo -n` (non-interactive) so the backgrounded monitor can't block on
   a prompt; `do_stop`'s fallback `pkill` may prompt interactively. `launch_openvpn` also uses
   `sudo -n` for the launch itself (no interactive password prompt is expected, unlike fortivpn's
@@ -197,9 +251,12 @@ back to `sudo -l <cmd>`.
 
 Passwordless sudo only applies to the exact rendered command line. The fix for portability is
 that the rule is *generated*, so moving the repo or switching the binary path can't silently
-desync it — but you **must re-run `install-sudoers`** after changing `VPN_TYPE`, `OPENFORTIVPN`/
-`OPENVPN`, `VPNCLI_CONFIG_DIR`, `VPNCLI_STATE_DIR` (moves the openvpn auth-file path), or the
-config path, then confirm with `doctor`.
+desync it — but you **must re-run `install-sudoers`** after changing `OPENFORTIVPN`/`OPENVPN`,
+`VPNCLI_CONFIG_DIR`, `VPNCLI_STATE_DIR` (moves the openvpn auth-file path), or the config path,
+then confirm with `doctor`. Changing `VPN_TYPE` itself does **not** require this — that's the
+point of `ACTIVE_SUDOERS_PATH` being per-backend (see "Switching backends"): as long as
+`install-sudoers` was already run once for each backend you use, both rules stay installed and
+`switch` just changes which one `sudo_has_nopasswd`/launch use.
 
 ## Gotcha: the config path doubles as the process fingerprint
 
@@ -215,6 +272,7 @@ sudoers rule and in every launch command.
 
 ## State / generated files (not source)
 
-`vpn.pid`, `vpn.log`(`.1`), and (openvpn backend) `openvpn.auth` under the state dir; the
-rendered file at `$SUDOERS_PATH`. An untracked repo-local `vpn.conf` may exist as migration input
-for `setup` (gitignored). These are runtime artifacts, not source.
+`vpn.pid`, `vpn.log`(`.1`), and (openvpn backend) `openvpn.auth` under the state dir; the rendered
+files at `${SUDOERS_PATH}-fortivpn`/`${SUDOERS_PATH}-openvpn` (and, on older installs predating
+per-backend sudoers, the unsuffixed `$SUDOERS_PATH`). An untracked repo-local `vpn.conf` may exist
+as migration input for `setup` (gitignored). These are runtime artifacts, not source.

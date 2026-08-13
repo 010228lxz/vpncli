@@ -55,15 +55,16 @@ vpnctl setup            # first run: pick a backend, config + password + sudoers
 vpnctl start            # spawn the background monitor (daemonizes)
 vpnctl stop             # stop the monitor; its trap tears the tunnel down
 vpnctl restart
+vpnctl switch <backend> # switch to fortivpn|openvpn (see "Switching backends" below)
 vpnctl status           # monitor + tunnel state
 vpnctl routes           # VPN routes, and whether it's a FULL or SPLIT tunnel
 vpnctl logs [-f]        # show / follow the log
 vpnctl doctor           # diagnostics — run this first when anything is wrong
-vpnctl set-password     # (re)store the VPN password in the secret store
-vpnctl set-otp-secret   # (re)store a TOTP seed for password+OTP gateways
-vpnctl unset-otp-secret # remove the stored TOTP seed
-vpnctl install-sudoers  # (re)install the passwordless-sudo rule
-vpnctl uninstall-sudoers
+vpnctl set-password     # (re)store the VPN password in the secret store (active backend only)
+vpnctl set-otp-secret   # (re)store a TOTP seed for password+OTP gateways (active backend only)
+vpnctl unset-otp-secret # remove the stored TOTP seed (active backend only)
+vpnctl install-sudoers  # (re)install the passwordless-sudo rule (active backend only)
+vpnctl uninstall-sudoers [--all]
 ```
 
 `doctor` is the primary debugging entry point. `setup` is the one-time bootstrap
@@ -94,6 +95,43 @@ the first `utun*` with an address. If that's ambiguous on your machine, pin the
 exact interface with `TUN_IFACE=utun4` in `settings` once you know which one
 openvpn is actually using (check `vpnctl logs` or `ifconfig` after connecting).
 
+## Switching backends
+
+Every per-backend artifact is kept **independent**, so both backends can be
+provisioned at once and you can flip between them without re-entering
+anything or answering a sudo prompt:
+
+| Per-backend, never shared | fortivpn | openvpn |
+|---|---|---|
+| Config file | `vpn.conf` | `vpn.ovpn` |
+| Password (secret store) | account `<user>-fortivpn` | account `<user>-openvpn` |
+| OTP seed (secret store, optional) | account `<user>-fortivpn-totp` | account `<user>-openvpn-totp` |
+| Passwordless-sudo rule | `/etc/sudoers.d/vpncli-fortivpn` | `/etc/sudoers.d/vpncli-openvpn` |
+
+This is also why one backend needing OTP and the other not is a *non-issue*:
+e.g. openvpn can require password+OTP while fortivpn stays password-only (or
+vice versa) — each backend only ever looks at its own OTP account, so an OTP
+secret set for one never gets appended to the other's password.
+
+To provision the second backend, run `vpnctl setup` again and pick the other
+backend at the prompt (this creates its own config/password/sudoers without
+touching the backend you already have working). Once both are ready:
+
+```sh
+vpnctl switch openvpn    # or: vpnctl switch fortivpn
+```
+
+`switch` persists `VPN_TYPE` to `settings`, stops/restarts the monitor if it
+was running, and re-checks readiness for the target backend — if anything
+(config, password, sudoers) isn't provisioned yet, it tells you exactly what's
+missing instead of failing silently.
+
+**Upgrade note:** before per-backend scoping, both backends shared one
+password/OTP account. `secret_get` still falls back to that shared legacy
+account when no backend-specific one exists yet, so existing installs keep
+working unchanged; running `set-password`/`set-otp-secret` while a given
+backend is active migrates that backend onto its own account going forward.
+
 ## Password + OTP (2FA / RADIUS gateways)
 
 Some gateways (common with FortiGate + RADIUS, or corporate OpenVPN setups)
@@ -107,10 +145,13 @@ vpnctl set-otp-secret     # store the TOTP *seed* (base32 secret), once
 ```
 
 This stores the TOTP **seed** — not a 6-digit code — in the same OS secret
-store as your password (Keychain/secret-tool/pass), under a separate entry.
-The seed is the same base32 string your authenticator app was given when you
-scanned the QR code (often shown as text alongside the QR code during
-enrollment, or extractable from the `otpauth://` URI's `secret=` parameter).
+store as your password (Keychain/secret-tool/pass), under a separate entry
+scoped to the *active* backend only (see "Switching backends" above) — e.g.
+require it on openvpn while leaving fortivpn password-only, with no
+cross-contamination either way. The seed is the same base32 string your
+authenticator app was given when you scanned the QR code (often shown as
+text alongside the QR code during enrollment, or extractable from the
+`otpauth://` URI's `secret=` parameter).
 
 Once stored, **every** connection attempt (initial `start`, and every
 auto-reconnect the monitor performs) regenerates a fresh code and appends it
@@ -140,7 +181,9 @@ reports whether a TOTP seed is configured. Remove it with
 - **`share/vpn.conf.example`** / **`share/vpn.ovpn.example`** — config templates
   for each backend.
 - **`share/vpncli.sudoers.template`** / **`share/vpncli-openvpn.sudoers.template`**
-  — rendered per machine by `install-sudoers`, for the active backend.
+  — rendered per machine by `install-sudoers`, one file per backend
+  (`/etc/sudoers.d/vpncli-fortivpn` / `-openvpn`), for the active backend at
+  the time `install-sudoers` runs.
 
 ### Where things live
 
@@ -169,32 +212,39 @@ INTERVAL=10                                 # health-check interval (s)
 CONNECT_GRACE=20                            # grace after a (re)connect (s)
 HALF_OPEN_CHECKS=3                          # half-open polls before forcing reconnect
 MAX_LOG_BYTES=1048576                       # log rotation threshold
-SUDOERS_PATH=/etc/sudoers.d/vpncli          # where the generated rule installs
+SUDOERS_PATH=/etc/sudoers.d/vpncli          # base path; the installed rule is
+                                              # suffixed per backend, e.g.
+                                              # /etc/sudoers.d/vpncli-fortivpn
 ```
 
-After changing `VPN_TYPE`, `OPENFORTIVPN`/`OPENVPN`, or the config location,
-re-run `vpnctl install-sudoers` so the passwordless rule matches the new command.
+After changing `OPENFORTIVPN`/`OPENVPN`, or the config location, re-run
+`vpnctl install-sudoers` so the passwordless rule matches the new command
+(switching `VPN_TYPE` itself doesn't require this — see "Switching backends").
 
 ## Security model
 
 The design keeps secrets out of the process list (`ps`) and out of sudo prompts:
 
-- The VPN password lives in the OS secret store, never in the repo. For the
+- The VPN password lives in the OS secret store, never in the repo, under an
+  account scoped to the active backend (see "Switching backends"). For the
   fortivpn backend, `vpnctl` exports it as `VPN_PASSWORD` so the expect helper
   reads it from the environment, never from argv. For the openvpn backend, it's
   written to a fixed, owner-only `--auth-user-pass` file regenerated fresh
   before every launch — also never on argv.
-- If a TOTP seed is configured (`set-otp-secret`), the current 6-digit code is
-  generated fresh via `oathtool` immediately before every launch attempt (never
-  cached, never written to disk on its own) and appended to the password in
-  memory before it's exported/written to the auth file.
-- **Passwordless sudo is generated per machine.** `install-sudoers` renders the
-  template for the active backend with this machine's user, binary path, and
-  config path (plus the auth-file path for openvpn), then validates it with
-  `visudo -cf` before installing. Because the rule is generated from the exact
-  command the tool runs, moving the repo can't silently desync it (the original
-  hardcoded rule's main failure mode). `doctor` verifies the rule actually
-  grants **NOPASSWD** — not merely "allowed with a password".
+- If a TOTP seed is configured (`set-otp-secret`) for the active backend, the
+  current 6-digit code is generated fresh via `oathtool` immediately before
+  every launch attempt (never cached, never written to disk on its own) and
+  appended to the password in memory before it's exported/written to the auth
+  file.
+- **Passwordless sudo is generated per machine, one rule file per backend**
+  (`/etc/sudoers.d/vpncli-fortivpn`, `/etc/sudoers.d/vpncli-openvpn`) — so
+  provisioning one backend never removes the other's rule. `install-sudoers`
+  renders the template for the active backend with this machine's user, binary
+  path, and config path (plus the auth-file path for openvpn), then validates
+  it with `visudo -cf` before installing. Because the rule is generated from
+  the exact command the tool runs, moving the repo can't silently desync it
+  (the original hardcoded rule's main failure mode). `doctor` verifies the
+  rule actually grants **NOPASSWD** — not merely "allowed with a password".
 - Files the tool writes (config, logs, pid, the openvpn auth file) are created
   owner-only (`umask 077`; `setup` also tightens the config and state dirs to
   `700`).
@@ -224,8 +274,11 @@ The secret store and `set-password` are unaffected by this.
 
 ```sh
 vpnctl stop
-vpnctl uninstall-sudoers
+vpnctl uninstall-sudoers --all         # removes both backends' sudoers rules
 rm -rf ~/.config/vpncli ~/.local/state/vpncli
-# remove the password: macOS → Keychain Access; Linux → secret-tool/pass
+# remove the password(s): macOS → Keychain Access; Linux → secret-tool/pass
+# (look for accounts <user>-fortivpn / <user>-openvpn / *-totp, and the
+# legacy <user> / <user>-totp accounts if this install predates per-backend
+# credentials — see "Switching backends")
 brew uninstall vpncli   # if installed via Homebrew
 ```

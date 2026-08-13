@@ -88,21 +88,35 @@ Usage: $PROG <command>
   start              Start the background monitor (auto-reconnecting tunnel)
   stop               Stop the monitor; its trap tears the tunnel down
   restart
+  switch <backend>   Switch to fortivpn|openvpn (persists to settings); if the
+                     target backend is already fully configured (config,
+                     password, sudoers — each independent per backend) this
+                     needs no re-entry and restarts the monitor if it was
+                     running. Otherwise it lists exactly what's still missing
   status             Monitor + tunnel state
   routes             VPN routes, and whether it's a FULL or SPLIT tunnel
   logs [-f]          Show (or follow) the log
   doctor             Diagnostics — run this first when anything is wrong
   setup              First-run setup: config + password + sudoers
-  set-password       Store the VPN password in the OS secret store
+  set-password       Store the VPN password in the OS secret store (scoped to
+                     the active backend — fortivpn and openvpn each keep
+                     their own password, so switching never mixes them up)
   set-otp-secret     Store a TOTP seed; a fresh 6-digit code is appended to
-                     the password on every connect (for password+OTP gateways)
-  unset-otp-secret   Remove the stored TOTP seed
-  install-sudoers    (Re)install the passwordless-sudo rule for this machine
-  uninstall-sudoers  Remove the passwordless-sudo rule
+                     the password on every connect (for password+OTP
+                     gateways). Also scoped to the active backend only — e.g.
+                     you can require OTP on openvpn while fortivpn stays
+                     password-only, with no cross-contamination either way
+  unset-otp-secret   Remove the stored TOTP seed (active backend only)
+  install-sudoers    (Re)install the passwordless-sudo rule for the active
+                     backend (fortivpn and openvpn each get their own rule
+                     file, so installing one never removes the other's)
+  uninstall-sudoers [--all]
+                     Remove the active backend's passwordless-sudo rule
+                     (--all removes both backends' rules)
 
 Config:  $CONFIG_PATH  (openvpn: $OPENVPN_CONFIG_PATH)
 State:   $STATE_DIR
-Backend: $VPN_TYPE   (set VPN_TYPE=fortivpn|openvpn in $SETTINGS_FILE)
+Backend: $VPN_TYPE   (set VPN_TYPE=fortivpn|openvpn in $SETTINGS_FILE, or: $PROG switch <backend>)
 EOF
     exit 1
 }
@@ -167,25 +181,78 @@ resolve_secret_backend() {
 
 # --- secret store abstraction ---------------------------------------------
 # "kind" selects which secret under the same $SECRET_SERVICE: "password" (the
-# default, same account as always — existing stored passwords keep working
-# unchanged) or "otp" (the TOTP seed, stored under a distinct account so it
-# never collides with the password entry).
+# default) or "otp" (the TOTP seed). Each is further scoped by the *active*
+# $VPN_TYPE, so fortivpn and openvpn get fully independent password/OTP
+# entries — this is what makes `switch` seamless (both backends' credentials
+# can be stored at once, with nothing to re-enter) and, critically, is what
+# stops an OTP seed configured for one backend from silently getting appended
+# to the *other* backend's password after a switch (e.g. openvpn needs
+# password+OTP, fortivpn here is password-only — without per-backend scoping,
+# `secret_present otp` can't tell which backend it's answering for).
+# secret_account_legacy is the pre-multi-backend, backend-agnostic account
+# name; secret_get falls back to it so upgrading users don't lose an
+# already-stored secret on first run (secret_set always (re)writes forward to
+# the new per-backend account).
 secret_account() {
+    case "${1:-password}" in
+        otp) printf '%s\n' "${USER}-${VPN_TYPE}-totp" ;;
+        *)   printf '%s\n' "${USER}-${VPN_TYPE}" ;;
+    esac
+}
+
+secret_account_legacy() {
     case "${1:-password}" in
         otp) printf '%s\n' "${USER}-totp" ;;
         *)   printf '%s\n' "$USER" ;;
     esac
 }
 
-secret_get() {
-    local kind="${1:-password}" account
-    account="$(secret_account "$kind")"
+_secret_get_account() {
+    local account="$1"
     case "$SECRET_BACKEND_RESOLVED" in
         security)    security find-generic-password -a "$account" -s "$SECRET_SERVICE" -w 2>/dev/null ;;
         secret-tool) secret-tool lookup service "$SECRET_SERVICE" account "$account" 2>/dev/null ;;
         pass)        pass show "$SECRET_SERVICE/$account" 2>/dev/null ;;
         *)           return 1 ;;
     esac
+}
+
+_secret_delete_account() {
+    local account="$1"
+    case "$SECRET_BACKEND_RESOLVED" in
+        security)    security delete-generic-password -a "$account" -s "$SECRET_SERVICE" >/dev/null 2>&1 ;;
+        secret-tool) secret-tool clear service "$SECRET_SERVICE" account "$account" >/dev/null 2>&1 ;;
+        pass)        pass rm -f "$SECRET_SERVICE/$account" >/dev/null 2>&1 ;;
+        *)           return 1 ;;
+    esac
+}
+
+secret_get() {
+    local kind="${1:-password}" account v
+    account="$(secret_account "$kind")"
+    if v="$(_secret_get_account "$account")" && [ -n "$v" ]; then
+        printf '%s' "$v"; return 0
+    fi
+    # Fall back to the shared pre-multi-backend account.
+    account="$(secret_account_legacy "$kind")"
+    _secret_get_account "$account"
+}
+
+# Like secret_get, but reports which account actually served the value (the
+# per-backend one, or the legacy fallback) — used by `doctor`/`set-*` output
+# so it never claims a backend-scoped account is in use when a value is in
+# fact still coming from the pre-multi-backend shared entry.
+secret_which_account() {
+    local kind="${1:-password}" account v
+    account="$(secret_account "$kind")"
+    if v="$(_secret_get_account "$account")" && [ -n "$v" ]; then
+        printf '%s\n' "$account"; return 0
+    fi
+    account="$(secret_account_legacy "$kind")"
+    if v="$(_secret_get_account "$account")" && [ -n "$v" ]; then
+        printf '%s\n' "$account"; return 0
+    fi
+    return 1
 }
 
 secret_set() {
@@ -200,7 +267,7 @@ secret_set() {
             # trade-off, unlike the per-connection exposure this design removes.
             security add-generic-password -U -a "$account" -s "$SECRET_SERVICE" -w "$pw" >/dev/null 2>&1 ;;
         secret-tool)
-            printf '%s' "$pw" | secret-tool store --label="$SECRET_SERVICE ($kind)" \
+            printf '%s' "$pw" | secret-tool store --label="$SECRET_SERVICE ($VPN_TYPE $kind)" \
                 service "$SECRET_SERVICE" account "$account" >/dev/null 2>&1 ;;
         pass)
             printf '%s\n' "$pw" | pass insert -m -f "$SECRET_SERVICE/$account" >/dev/null 2>&1 ;;
@@ -209,14 +276,14 @@ secret_set() {
 }
 
 secret_delete() {
-    local kind="${1:-password}" account
-    account="$(secret_account "$kind")"
-    case "$SECRET_BACKEND_RESOLVED" in
-        security)    security delete-generic-password -a "$account" -s "$SECRET_SERVICE" >/dev/null 2>&1 ;;
-        secret-tool) secret-tool clear service "$SECRET_SERVICE" account "$account" >/dev/null 2>&1 ;;
-        pass)        pass rm -f "$SECRET_SERVICE/$account" >/dev/null 2>&1 ;;
-        *)           return 1 ;;
-    esac
+    local kind="${1:-password}" a_new a_legacy ok=1
+    # Clear both the per-backend and legacy accounts, so a stale legacy entry
+    # can't resurrect (via secret_get's fallback) after "removing" a secret.
+    a_new="$(secret_account "$kind")"
+    a_legacy="$(secret_account_legacy "$kind")"
+    _secret_delete_account "$a_new"    && ok=0
+    _secret_delete_account "$a_legacy" && ok=0
+    return "$ok"
 }
 
 secret_present() {
@@ -536,6 +603,82 @@ do_restart() {
     do_start
 }
 
+# Switches VPN_TYPE at runtime and persists it to $SETTINGS_FILE, without the
+# full `setup` wizard. This is only "seamless" (no re-prompting, no sudo
+# password) when the target backend has already been fully provisioned once
+# (config file, password [+ optional OTP seed], and its own sudoers rule —
+# all of which are backend-scoped, see secret_account()/ACTIVE_SUDOERS_PATH),
+# e.g. via `setup` or `set-password`/`set-otp-secret`/`install-sudoers` run at
+# least once while that backend was active. Otherwise it tells you exactly
+# what's still missing instead of silently failing.
+do_switch() {
+    local target="${1:-}" was_running="" ready=1 var_name
+    case "$target" in
+        fortivpn|openvpn) ;;
+        "")
+            echo "Usage: $PROG switch <fortivpn|openvpn>" >&2
+            echo "Currently: $VPN_TYPE" >&2
+            return 1 ;;
+        *)
+            echo "Error: unknown backend '$target' (expected 'fortivpn' or 'openvpn')" >&2
+            return 1 ;;
+    esac
+
+    if [ "$target" = "$VPN_TYPE" ]; then
+        echo "Already using $VPN_TYPE."
+        return 0
+    fi
+
+    if was_running="$(monitor_pid)"; then
+        echo "Stopping $VPN_TYPE monitor before switching..."
+        do_stop
+    fi
+
+    settings_set VPN_TYPE "$target"
+    VPN_TYPE="$target"
+    resolve_active_backend
+    echo "Switched backend: $VPN_TYPE"
+    echo
+
+    # Readiness check scoped to what launching $VPN_TYPE actually needs — every
+    # one of these is independent per backend, so this never depends on how the
+    # *other* backend is configured.
+    if [ -z "$ACTIVE_BIN" ]; then
+        var_name="OPENFORTIVPN"; [ "$VPN_TYPE" = "openvpn" ] && var_name="OPENVPN"
+        echo "  [FAIL] $VPN_TYPE binary not found — install it or set $var_name in $SETTINGS_FILE" >&2
+        ready=0
+    fi
+    if [ ! -r "$ACTIVE_CONFIG" ]; then
+        echo "  [FAIL] no config at $ACTIVE_CONFIG — run: $PROG setup" >&2
+        ready=0
+    fi
+    if [ "$VPN_TYPE" = "openvpn" ] && [ -z "$OPENVPN_USERNAME" ]; then
+        echo "  [FAIL] OPENVPN_USERNAME not set — run: $PROG setup" >&2
+        ready=0
+    fi
+    if ! secret_present password; then
+        echo "  [FAIL] no $VPN_TYPE password stored (account: $(secret_account password)) — run: $PROG set-password" >&2
+        ready=0
+    fi
+    if ! sudo_has_nopasswd "$ACTIVE_LAUNCH_CMD"; then
+        echo "  [FAIL] passwordless sudo not configured for $VPN_TYPE — run: $PROG install-sudoers" >&2
+        ready=0
+    fi
+
+    if [ "$ready" -eq 1 ]; then
+        echo "$VPN_TYPE is fully configured."
+        if [ -n "$was_running" ]; then
+            do_start
+        else
+            echo "Run: $PROG start"
+        fi
+    else
+        echo
+        echo "Fix the [FAIL] item(s) above, then: $PROG doctor   (or: $PROG start)"
+        return 1
+    fi
+}
+
 do_status() {
     local pid inet
     if pid="$(monitor_pid)"; then
@@ -679,23 +822,23 @@ do_doctor() {
     if [ -z "$SECRET_BACKEND_RESOLVED" ]; then
         report fail "no secret backend available — need 'security' (macOS), 'secret-tool', or 'pass'"
     elif secret_present password; then
-        report ok "VPN password stored (backend: $SECRET_BACKEND_RESOLVED, service: $SECRET_SERVICE)"
+        report ok "VPN password stored (backend: $SECRET_BACKEND_RESOLVED, account: $(secret_which_account password))"
     else
-        report fail "no VPN password in $SECRET_BACKEND_RESOLVED (service: $SECRET_SERVICE) — run: $PROG set-password"
+        report fail "no $VPN_TYPE password in $SECRET_BACKEND_RESOLVED (account: $(secret_account password)) — run: $PROG set-password"
     fi
 
     if secret_present otp; then
         if command -v oathtool >/dev/null 2>&1; then
-            report ok "TOTP secret stored — a fresh 6-digit code is appended to the password each connect"
+            report ok "TOTP secret stored for $VPN_TYPE (account: $(secret_which_account otp)) — a fresh 6-digit code is appended to the password each connect"
         else
             report fail "TOTP secret stored but 'oathtool' is missing — install it (brew install oath-toolkit / apt install oathtool)"
         fi
     else
-        report info "no TOTP secret configured (only needed for password+OTP gateways — set with: $PROG set-otp-secret)"
+        report info "no TOTP secret configured for $VPN_TYPE (only needed for password+OTP gateways — set with: $PROG set-otp-secret). Backends are scoped independently, so this is unaffected by any OTP secret stored for the other backend."
     fi
 
     if [ -n "$ACTIVE_BIN" ] && sudo_has_nopasswd "$ACTIVE_LAUNCH_CMD"; then
-        report ok "passwordless sudo for the $VPN_TYPE launch command"
+        report ok "passwordless sudo for the $VPN_TYPE launch command (rule: $ACTIVE_SUDOERS_PATH)"
     else
         report fail "passwordless sudo for $VPN_TYPE missing/mismatched — run: $PROG install-sudoers"
     fi
@@ -735,6 +878,7 @@ do_set_password() {
         echo "Error: no secret backend available (need 'security', 'secret-tool', or 'pass')." >&2
         return 1
     fi
+    echo "Storing password for backend: $VPN_TYPE (independent of any other backend's password)."
     tries=0
     while :; do
         tries=$((tries + 1))
@@ -756,7 +900,7 @@ do_set_password() {
     done
 
     if secret_set "$p1"; then
-        echo "Stored VPN password (backend: $SECRET_BACKEND_RESOLVED, service: $SECRET_SERVICE)."
+        echo "Stored VPN password for $VPN_TYPE (backend: $SECRET_BACKEND_RESOLVED, account: $(secret_account password))."
         echo "Verify with: $PROG doctor"
     else
         echo "Failed to store password in the secret store." >&2; return 1
@@ -774,6 +918,7 @@ do_set_otp_secret() {
     echo "This is NOT a 6-digit code; it's the long string used to generate them."
     echo "Once stored, vpnctl appends a freshly generated 6-digit code to your"
     echo "password on every connection attempt automatically."
+    echo "Scoped to backend: $VPN_TYPE only — the other backend is unaffected."
     echo
     tries=0
     while :; do
@@ -797,7 +942,7 @@ do_set_otp_secret() {
     done
 
     if secret_set "$seed" otp; then
-        echo "Stored TOTP secret (backend: $SECRET_BACKEND_RESOLVED, service: $SECRET_SERVICE)."
+        echo "Stored TOTP secret for $VPN_TYPE (backend: $SECRET_BACKEND_RESOLVED, account: $(secret_account otp))."
         echo "Verify with: $PROG doctor"
     else
         echo "Failed to store TOTP secret in the secret store." >&2; return 1
@@ -935,7 +1080,7 @@ do_install_sudoers() {
             rm -f "$tmp"; return 1
         fi
 
-        echo "Installing passwordless-sudo rule to $SUDOERS_PATH (requires sudo):"
+        echo "Installing passwordless-sudo rule to $ACTIVE_SUDOERS_PATH (requires sudo):"
         echo "  user:    $USER"
         echo "  openvpn: $OPENVPN"
         echo "  config:  $OPENVPN_CONFIG_PATH"
@@ -968,14 +1113,14 @@ do_install_sudoers() {
             rm -f "$tmp"; return 1
         fi
 
-        echo "Installing passwordless-sudo rule to $SUDOERS_PATH (requires sudo):"
+        echo "Installing passwordless-sudo rule to $ACTIVE_SUDOERS_PATH (requires sudo):"
         echo "  user:         $USER"
         echo "  openfortivpn: $OPENFORTIVPN"
         echo "  config:       $CONFIG_PATH"
         echo "  pkill:        $PKILL"
     fi
 
-    if sudo install -m 0440 "$tmp" "$SUDOERS_PATH"; then
+    if sudo install -m 0440 "$tmp" "$ACTIVE_SUDOERS_PATH"; then
         rm -f "$tmp"
         echo "Installed. Verify with: $PROG doctor"
     else
@@ -985,11 +1130,26 @@ do_install_sudoers() {
 }
 
 do_uninstall_sudoers() {
-    if [ -f "$SUDOERS_PATH" ]; then
-        echo "Removing $SUDOERS_PATH (requires sudo)..."
+    if [ "${1:-}" = "--all" ]; then
+        local p any=0
+        for p in "${SUDOERS_PATH}-fortivpn" "${SUDOERS_PATH}-openvpn" "$SUDOERS_PATH"; do
+            if [ -f "$p" ]; then
+                echo "Removing $p (requires sudo)..."
+                sudo rm -f "$p" && any=1
+            fi
+        done
+        if [ "$any" -eq 1 ]; then echo "Removed."; else echo "No sudoers rules found."; fi
+        return 0
+    fi
+    if [ -f "$ACTIVE_SUDOERS_PATH" ]; then
+        echo "Removing $ACTIVE_SUDOERS_PATH (requires sudo)..."
+        sudo rm -f "$ACTIVE_SUDOERS_PATH" && echo "Removed."
+    elif [ -f "$SUDOERS_PATH" ]; then
+        # Pre-multi-backend (unsuffixed) install layout.
+        echo "Removing legacy $SUDOERS_PATH (requires sudo)..."
         sudo rm -f "$SUDOERS_PATH" && echo "Removed."
     else
-        echo "No sudoers rule at $SUDOERS_PATH"
+        echo "No sudoers rule at $ACTIVE_SUDOERS_PATH"
     fi
 }
 
@@ -1012,11 +1172,10 @@ do_setup() {
     # Re-resolve the active binary/config for the (possibly just-changed) backend.
     if [ "$VPN_TYPE" = "openvpn" ]; then
         [ -z "$OPENVPN" ] && OPENVPN="$(detect_openvpn || true)"
-        ACTIVE_BIN="$OPENVPN"; ACTIVE_CONFIG="$OPENVPN_CONFIG_PATH"
     else
         [ -z "$OPENFORTIVPN" ] && OPENFORTIVPN="$(detect_openfortivpn || true)"
-        ACTIVE_BIN="$OPENFORTIVPN"; ACTIVE_CONFIG="$CONFIG_PATH"
     fi
+    resolve_active_backend
     echo
 
     # 1. Config
@@ -1091,6 +1250,11 @@ do_setup() {
 
     # 4. Diagnostics
     do_doctor
+    echo
+    echo "Tip: run this same 'setup' again with the other backend selected at the"
+    echo "prompt above to provision it too (separate config, password, OTP secret,"
+    echo "and sudoers rule — see backend-scoped notes above). With both"
+    echo "provisioned, switch between them any time with: $PROG switch fortivpn|openvpn"
 }
 
 # ===========================================================================
@@ -1103,25 +1267,35 @@ EXPECT_SCRIPT="$(find_asset fortiVPN.expect || true)"
 SECRET_BACKEND_RESOLVED="$(resolve_secret_backend || true)"
 
 # Active backend selection: everything else (tunnel_running, teardown, doctor,
-# sudoers) keys off ACTIVE_BIN/ACTIVE_CONFIG/ACTIVE_LAUNCH_CMD rather than
-# branching on VPN_TYPE everywhere.
-case "$VPN_TYPE" in
-    openvpn)
-        ACTIVE_BIN="$OPENVPN"
-        ACTIVE_CONFIG="$OPENVPN_CONFIG_PATH"
-        ACTIVE_LAUNCH_CMD="$OPENVPN --config $OPENVPN_CONFIG_PATH --auth-user-pass $OPENVPN_AUTH_FILE"
-        ;;
-    *)
-        ACTIVE_BIN="$OPENFORTIVPN"
-        ACTIVE_CONFIG="$CONFIG_PATH"
-        ACTIVE_LAUNCH_CMD="$OPENFORTIVPN -c $CONFIG_PATH"
-        ;;
-esac
+# sudoers) keys off ACTIVE_BIN/ACTIVE_CONFIG/ACTIVE_LAUNCH_CMD/
+# ACTIVE_SUDOERS_PATH rather than branching on VPN_TYPE everywhere. A function
+# (not an inline block) so `do_switch` can recompute these after flipping
+# $VPN_TYPE at runtime, without forking a fresh process.
+resolve_active_backend() {
+    case "$VPN_TYPE" in
+        openvpn)
+            ACTIVE_BIN="$OPENVPN"
+            ACTIVE_CONFIG="$OPENVPN_CONFIG_PATH"
+            ACTIVE_LAUNCH_CMD="$OPENVPN --config $OPENVPN_CONFIG_PATH --auth-user-pass $OPENVPN_AUTH_FILE"
+            ;;
+        *)
+            ACTIVE_BIN="$OPENFORTIVPN"
+            ACTIVE_CONFIG="$CONFIG_PATH"
+            ACTIVE_LAUNCH_CMD="$OPENFORTIVPN -c $CONFIG_PATH"
+            ;;
+    esac
+    # Suffixed per backend (vpncli-fortivpn / vpncli-openvpn) so both backends'
+    # passwordless-sudo rules can be installed and kept at once — switching
+    # VPN_TYPE then never needs a fresh interactive `install-sudoers`.
+    ACTIVE_SUDOERS_PATH="${SUDOERS_PATH}-${VPN_TYPE}"
+}
+resolve_active_backend
 
 case "${1:-}" in
     start)             do_start ;;
     stop)              do_stop ;;
     restart)           do_restart ;;
+    switch)            do_switch "${2:-}" ;;
     status)            do_status ;;
     routes)            do_routes ;;
     logs)              do_logs "${2:-}" ;;
@@ -1131,7 +1305,7 @@ case "${1:-}" in
     set-otp-secret)    do_set_otp_secret ;;
     unset-otp-secret)  do_unset_otp_secret ;;
     install-sudoers)   do_install_sudoers ;;
-    uninstall-sudoers) do_uninstall_sudoers ;;
+    uninstall-sudoers) do_uninstall_sudoers "${2:-}" ;;
     __run__)           run_monitor ;;
     -h|--help|help)    usage ;;
     *)                 usage ;;

@@ -2,8 +2,10 @@
 #
 # `vpnctl install-sudoers` renders this template with the values detected on
 # THIS machine (user, openfortivpn path, config path, pkill path) and installs
-# the result to the configured sudoers path (default /etc/sudoers.d/vpncli),
-# validated with `visudo -cf`.
+# the result to the configured sudoers path, suffixed for this backend
+# (default /etc/sudoers.d/vpncli-fortivpn — see ACTIVE_SUDOERS_PATH), so it
+# never clobbers the openvpn backend's own rule file, validated with
+# `visudo -cf`.
 #
 # Passwordless sudo only applies to the EXACT command line below. Both lines are
 # rendered from the same paths the tool actually runs, so:
