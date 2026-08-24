@@ -33,7 +33,7 @@ case "$command_name" in
         mkdir -p "$(dirname "$pid_file")"
         VPN_PASSWORD=$password
         export VPN_PASSWORD
-        "$expect_script" "$vpn_binary" "$config" >/dev/null 2>&1 &
+        "$expect_script" "$vpn_binary" "$config" &
         pid=$!
         umask 077
         printf '%s\n' "$pid" > "$pid_file"
