@@ -57,6 +57,15 @@ and must be initialized with `pass init <GPG-key-id>`.
 teardown commands, so the setup user must be allowed to run `sudo`. Review the
 security notes before using it on a shared machine.
 
+For passwordless sudo, the active VPN config and every parent directory must be
+root-owned and not writable by group or other users. The config must also avoid
+external script/plugin directives (`up`, `down`, `plugin`, `route-up`, and
+similar), because those would otherwise provide root code execution. A common
+secure layout is `/etc/vpncli/`; create or copy the provider config there and
+set `VPNCLI_CONFIG_DIR=/etc/vpncli` in `settings` before running
+`vpnctl install-sudoers`. If you keep the default user-writable config under
+`~/.config/vpncli`, `install-sudoers` will refuse to create the rule.
+
 ## Usage
 
 ```sh
@@ -263,6 +272,9 @@ The design keeps secrets out of the process list (`ps`) and out of sudo prompts:
   the exact command the tool runs, moving the repo can't silently desync it
   (the original hardcoded rule's main failure mode). `doctor` verifies the
   rule actually grants **NOPASSWD** — not merely "allowed with a password".
+  Before generating a rule, `vpnctl` requires the active config and all parent
+  directories to be root-owned, rejects symlink paths, and blocks config
+  directives that can launch external scripts or plugins.
 - Files the tool writes (config, logs, pid, the openvpn auth file) are created
   owner-only (`umask 077`; `setup` also tightens the config and state dirs to
   `700`).

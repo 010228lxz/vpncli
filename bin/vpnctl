@@ -462,6 +462,57 @@ require_config() {
     fi
 }
 
+_path_owner() {
+    if [ "$OS" = "Darwin" ]; then
+        stat -f '%Su' "$1" 2>/dev/null
+    else
+        stat -c '%U' "$1" 2>/dev/null
+    fi
+}
+
+_path_mode() {
+    if [ "$OS" = "Darwin" ]; then
+        stat -f '%Lp' "$1" 2>/dev/null
+    else
+        stat -c '%a' "$1" 2>/dev/null
+    fi
+}
+
+# A sudoers rule must never grant root execution from a path the invoking user
+# can replace. Check the file and every parent directory, not only the leaf:
+# a writable parent would allow replacing an otherwise root-owned config.
+require_privileged_path() {
+    local path="$1" current owner mode
+    [ -e "$path" ] && [ ! -L "$path" ] || {
+        echo "Error: privileged path must be a regular, non-symlink path: $path" >&2
+        return 1
+    }
+    current="$path"
+    while [ "$current" != "/" ] && [ -n "$current" ]; do
+        owner="$(_path_owner "$current")"
+        mode="$(_path_mode "$current")"
+        if [ "$owner" != "root" ] || [ -z "$mode" ] || (( (8#$mode) & 18 )); then
+            echo "Error: privileged path must be root-owned and not group/world-writable:" >&2
+            echo "  $current (owner: ${owner:-unknown}, mode: ${mode:-unknown})" >&2
+            echo "Move the VPN config and its parent directory under a root-owned path (for example /etc/vpncli), then retry." >&2
+            return 1
+        fi
+        current="$(dirname "$current")"
+    done
+}
+
+validate_config_security() {
+    local config="$1"
+    require_privileged_path "$config" || return 1
+    if grep -nE '^[[:space:]]*(up|down|route-up|route-pre-down|ipchange|client-connect|client-disconnect|plugin|tls-verify|learn-address|auth-user-pass-verify|pppd-plugin|pppd-call)([[:space:]]|=)' "$config" \
+        | grep -vE '^[^:]+:[[:space:]]*[#;]' >/dev/null 2>&1; then
+        echo "Error: config contains an external script/plugin directive that is unsafe with root sudoers execution:" >&2
+        grep -nE '^[[:space:]]*(up|down|route-up|route-pre-down|ipchange|client-connect|client-disconnect|plugin|tls-verify|learn-address|auth-user-pass-verify|pppd-plugin|pppd-call)([[:space:]]|=)' "$config" >&2
+        echo "Remove the directive or use a privileged, root-owned wrapper with an explicit allowlist." >&2
+        return 1
+    fi
+}
+
 load_credentials() {
     local pw otp
     if ! pw="$(secret_get password)" || [ -z "$pw" ]; then
@@ -1139,6 +1190,7 @@ do_install_sudoers() {
         return 1
     fi
     require_config || return 1
+    validate_config_security "$ACTIVE_CONFIG" || return 1
 
     if [ "$VPN_TYPE" = "openvpn" ]; then
         tmpl="$(find_asset vpncli-openvpn.sudoers.template)" || {
