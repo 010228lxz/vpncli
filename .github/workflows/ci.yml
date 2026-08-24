@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    tags: ['v*']
   pull_request:
 
 jobs:
@@ -48,6 +48,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: brew style + audit
         run: |
-          brew style --formula Formula/vpncli.rb
-          brew audit --strict --formula Formula/vpncli.rb || true
-
+          brew tap 010228lxz/vpncli "$GITHUB_WORKSPACE"
+          brew style --formula 010228lxz/vpncli/vpncli
+          brew audit --strict 010228lxz/vpncli/vpncli || true
