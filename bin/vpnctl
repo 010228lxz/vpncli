@@ -12,6 +12,18 @@ set -u
 umask 077
 
 # ---------------------------------------------------------------------------
+# Sourced vs executed. `return` only succeeds when this file is being sourced
+# (e.g. `. bin/vpnctl` from a test harness) — when run normally (`./vpnctl` or
+# `bash vpnctl`) it's a top-level script and `return` fails. This lets
+# tests/*.bats source the file to exercise its functions directly without
+# also triggering the final subcommand dispatch (and without needing argv).
+if (return 0 2>/dev/null); then
+    VPNCTL_SOURCED=1
+else
+    VPNCTL_SOURCED=0
+fi
+
+# ---------------------------------------------------------------------------
 # Resolve our own real path (through symlinks, e.g. Homebrew's bin symlink) so
 # we can find the libexec helper and re-exec ourselves as the monitor daemon.
 # ---------------------------------------------------------------------------
@@ -212,7 +224,7 @@ _secret_get_account() {
     case "$SECRET_BACKEND_RESOLVED" in
         security)    security find-generic-password -a "$account" -s "$SECRET_SERVICE" -w 2>/dev/null ;;
         secret-tool) secret-tool lookup service "$SECRET_SERVICE" account "$account" 2>/dev/null ;;
-        pass)        pass show "$SECRET_SERVICE/$account" 2>/dev/null ;;
+        pass)        pass show "$SECRET_SERVICE/$account" 2>/dev/null | head -n 1 ;;
         *)           return 1 ;;
     esac
 }
@@ -396,12 +408,32 @@ sudo_has_nopasswd() {
     esac
 }
 
-# Prints the monitor's pid and returns success only if it's actually alive.
+# True only if $1 is alive AND its command line actually looks like our own
+# monitor (`... $PROG __run__`, however it was invoked). This mitigates the
+# classic pid-file race: a stale PID_FILE surviving an unclean exit/crash,
+# later matching an unrelated process that the OS has since reused that same
+# pid for — `kill -0` alone can't distinguish that case from the real monitor.
+_pid_is_monitor() {
+    local pid="$1" cmd
+    cmd="$(ps -o command= -p "$pid" 2>/dev/null)" || cmd="$(ps -o args= -p "$pid" 2>/dev/null)" || return 1
+    case "$cmd" in
+        *"$PROG"*__run__*) return 0 ;;
+        *)                 return 1 ;;
+    esac
+}
+
+# Prints the monitor's pid and returns success only if it's actually alive
+# *and* identified as our monitor process (see _pid_is_monitor).
 monitor_pid() {
     [ -f "$PID_FILE" ] || return 1
     local pid
     pid="$(cat "$PID_FILE" 2>/dev/null)"
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    if kill -0 "$pid" 2>/dev/null && _pid_is_monitor "$pid"; then
+        printf '%s\n' "$pid"
+        return 0
+    fi
+    return 1
 }
 
 tunnel_running() {
@@ -477,6 +509,9 @@ launch_openvpn() {
     : > "$OPENVPN_AUTH_FILE"
     chmod 600 "$OPENVPN_AUTH_FILE" 2>/dev/null
     { printf '%s\n' "$OPENVPN_USERNAME"; printf '%s\n' "$VPN_PASSWORD"; } > "$OPENVPN_AUTH_FILE"
+    # shellcheck disable=SC2024  # redirect applies to this whole backgrounded
+    # job (bash), not to sudo's own stdout — sudo runs fine as the privileged
+    # child writing to the fd bash already opened before the fork.
     sudo -n "$OPENVPN" --config "$OPENVPN_CONFIG_PATH" --auth-user-pass "$OPENVPN_AUTH_FILE" \
         >> "$LOG_FILE" 2>&1 &
     TUNNEL_PID=$!
@@ -486,8 +521,10 @@ launch_openvpn() {
 # Used by the backgrounded monitor: never prompts (sudo -n), so it can't hang.
 teardown_tunnel() {
     if [ -n "$TUNNEL_PID" ] && kill -0 "$TUNNEL_PID" 2>/dev/null; then
+        # OpenVPN runs as root via sudo, so the unprivileged monitor may not be
+        # able to signal this wrapper. Do not wait here: the privileged pkill
+        # below is the authoritative teardown and must still run.
         kill "$TUNNEL_PID" 2>/dev/null
-        wait "$TUNNEL_PID" 2>/dev/null
     fi
     TUNNEL_PID=""
     if tunnel_running; then
@@ -783,6 +820,14 @@ do_doctor() {
         else
             report fail "OPENVPN_USERNAME not set — set it in $SETTINGS_FILE (or run: $PROG setup)"
         fi
+
+        if [ "$OS" = "Darwin" ]; then
+            if [ -n "$TUN_IFACE" ]; then
+                report ok "TUN_IFACE pinned ($TUN_IFACE) — unambiguous tunnel-health detection"
+            else
+                report warn "TUN_IFACE not set on macOS — health checks fall back to the first addressed utun*, which other VPNs/services can also use and may be misreported as this tunnel; set TUN_IFACE=utunN in $SETTINGS_FILE once you know which interface openvpn uses (see 'vpnctl logs' after connecting)"
+            fi
+        fi
     else
         if [ -n "$OPENFORTIVPN" ] && [ -x "$OPENFORTIVPN" ]; then
             report ok "openfortivpn found ($OPENFORTIVPN)"
@@ -1011,6 +1056,46 @@ settings_set() {
     chmod 600 "$SETTINGS_FILE" 2>/dev/null
 }
 
+# Escapes characters that are special inside a sudoers command spec: `*?[]`
+# are shell-style wildcards there (so a literal path/user containing one of
+# them would silently become a glob, potentially matching more than the exact
+# command that was rendered — the sudoers docs require backslash-escaping
+# them), and `,:=\` are argument/entry separators. Whitespace is rejected
+# outright by the caller rather than escaped, since a literal space would
+# still change how sudoers tokenizes the command's argument list.
+sudoers_escape() {
+    local s="$1" out="" ch i
+    for (( i = 0; i < ${#s}; i++ )); do
+        ch="${s:i:1}"
+        case "$ch" in
+            "\\"|","|":"|"="|"*"|"?"|"["|"]") out+="\\$ch" ;;
+            *)                                out+="$ch" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# Pure-bash placeholder substitution for the sudoers templates — deliberately
+# NOT `sed`: sed substitution needs a delimiter and treats `&`/backslash in
+# the replacement specially, so a path/user containing the delimiter char
+# (originally `|`) or those metacharacters could silently corrupt the
+# generated rule instead of erroring. `${line//pat/repl}` is a literal
+# substring replace (no regex, no delimiter), so any character is safe here;
+# `sudoers_escape` (above) separately guards against sudoers' OWN wildcard
+# syntax in the final file. Each extra arg is a "PLACEHOLDER=value" pair.
+render_template() {
+    local tmpl="$1"; shift
+    local line pair key val
+    while IFS= read -r line || [ -n "$line" ]; do
+        for pair in "$@"; do
+            key="${pair%%=*}"
+            val="${pair#*=}"
+            line="${line//$key/$val}"
+        done
+        printf '%s\n' "$line"
+    done < "$tmpl"
+}
+
 prompt_config() {
     local host port user
     echo "Enter your VPN gateway details (blank = keep template value):"
@@ -1033,6 +1118,15 @@ prompt_openvpn_config() {
     if [ -n "$user" ]; then
         settings_set OPENVPN_USERNAME "$user"
         OPENVPN_USERNAME="$user"
+    fi
+    if [ "$OS" = "Darwin" ] && [ -z "$TUN_IFACE" ]; then
+        echo
+        echo "Note: on macOS, openvpn's utun interface name is assigned dynamically and"
+        echo "isn't unique to this tool, so health checks are best-effort until pinned."
+        echo "After your first successful connect, run 'vpnctl status' or check"
+        echo "'vpnctl logs'/'ifconfig' for the utun name it used, then set:"
+        echo "  TUN_IFACE=utunN   in $SETTINGS_FILE"
+        echo "('vpnctl doctor' will keep warning about this until TUN_IFACE is set.)"
     fi
 }
 
@@ -1067,12 +1161,13 @@ do_install_sudoers() {
         chmod 600 "$OPENVPN_AUTH_FILE" 2>/dev/null
 
         tmp="$(mktemp "${TMPDIR:-/tmp}/vpncli.sudoers.XXXXXX")" || return 1
-        sed -e "s|__USER__|$USER|g" \
-            -e "s|__OPENVPN__|$OPENVPN|g" \
-            -e "s|__OVPN_CONFIG__|$OPENVPN_CONFIG_PATH|g" \
-            -e "s|__AUTH_FILE__|$OPENVPN_AUTH_FILE|g" \
-            -e "s|__PKILL__|$PKILL|g" \
-            "$tmpl" > "$tmp"
+        render_template "$tmpl" \
+            "__USER__=$(sudoers_escape "$USER")" \
+            "__OPENVPN__=$(sudoers_escape "$OPENVPN")" \
+            "__OVPN_CONFIG__=$(sudoers_escape "$OPENVPN_CONFIG_PATH")" \
+            "__AUTH_FILE__=$(sudoers_escape "$OPENVPN_AUTH_FILE")" \
+            "__PKILL__=$(sudoers_escape "$PKILL")" \
+            > "$tmp"
 
         if ! visudo -cf "$tmp" >/dev/null 2>&1; then
             echo "Error: generated sudoers failed validation:" >&2
@@ -1101,11 +1196,12 @@ do_install_sudoers() {
         done
 
         tmp="$(mktemp "${TMPDIR:-/tmp}/vpncli.sudoers.XXXXXX")" || return 1
-        sed -e "s|__USER__|$USER|g" \
-            -e "s|__OPENFORTIVPN__|$OPENFORTIVPN|g" \
-            -e "s|__CONFIG__|$CONFIG_PATH|g" \
-            -e "s|__PKILL__|$PKILL|g" \
-            "$tmpl" > "$tmp"
+        render_template "$tmpl" \
+            "__USER__=$(sudoers_escape "$USER")" \
+            "__OPENFORTIVPN__=$(sudoers_escape "$OPENFORTIVPN")" \
+            "__CONFIG__=$(sudoers_escape "$CONFIG_PATH")" \
+            "__PKILL__=$(sudoers_escape "$PKILL")" \
+            > "$tmp"
 
         if ! visudo -cf "$tmp" >/dev/null 2>&1; then
             echo "Error: generated sudoers failed validation:" >&2
@@ -1291,22 +1387,24 @@ resolve_active_backend() {
 }
 resolve_active_backend
 
-case "${1:-}" in
-    start)             do_start ;;
-    stop)              do_stop ;;
-    restart)           do_restart ;;
-    switch)            do_switch "${2:-}" ;;
-    status)            do_status ;;
-    routes)            do_routes ;;
-    logs)              do_logs "${2:-}" ;;
-    doctor)            do_doctor ;;
-    setup)             do_setup ;;
-    set-password)      do_set_password ;;
-    set-otp-secret)    do_set_otp_secret ;;
-    unset-otp-secret)  do_unset_otp_secret ;;
-    install-sudoers)   do_install_sudoers ;;
-    uninstall-sudoers) do_uninstall_sudoers "${2:-}" ;;
-    __run__)           run_monitor ;;
-    -h|--help|help)    usage ;;
-    *)                 usage ;;
-esac
+if [ "$VPNCTL_SOURCED" -eq 0 ]; then
+    case "${1:-}" in
+        start)             do_start ;;
+        stop)              do_stop ;;
+        restart)           do_restart ;;
+        switch)            do_switch "${2:-}" ;;
+        status)            do_status ;;
+        routes)            do_routes ;;
+        logs)              do_logs "${2:-}" ;;
+        doctor)            do_doctor ;;
+        setup)             do_setup ;;
+        set-password)      do_set_password ;;
+        set-otp-secret)    do_set_otp_secret ;;
+        unset-otp-secret)  do_unset_otp_secret ;;
+        install-sudoers)   do_install_sudoers ;;
+        uninstall-sudoers) do_uninstall_sudoers "${2:-}" ;;
+        __run__)           run_monitor ;;
+        -h|--help|help)    usage ;;
+        *)                 usage ;;
+    esac
+fi

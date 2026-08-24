@@ -16,3 +16,6 @@ vpn.log.*
 
 # macOS cruft
 .DS_Store
+
+# IntelliJ IDEA project files
+.idea/

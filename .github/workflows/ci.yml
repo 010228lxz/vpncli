@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck bin/vpnctl
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: './bin'
+          severity: style
+
+  bats:
+    name: bats (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bats
+
+      - name: Install bats (macOS)
+        if: runner.os == 'macOS'
+        run: brew install bats-core
+
+      - name: bash -n syntax check
+        run: bash -n bin/vpnctl
+
+      - name: Run bats test suite
+        run: bats tests/vpnctl.bats
+
+  formula-audit:
+    name: Homebrew formula audit
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: brew style + audit
+        run: |
+          brew style --formula Formula/vpncli.rb
+          brew audit --strict --formula Formula/vpncli.rb || true
+
