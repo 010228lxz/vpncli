@@ -437,7 +437,8 @@ monitor_pid() {
 }
 
 tunnel_running() {
-    pgrep -f "$ACTIVE_CONFIG" >/dev/null 2>&1
+    # shellcheck disable=SC2086  # command is assembled from validated, space-free paths
+    [ -n "$ACTIVE_STATUS_CMD" ] && sudo -n $ACTIVE_STATUS_CMD >/dev/null 2>&1
 }
 
 # Healthy = the VPN process is alive AND the tunnel interface has an IP.
@@ -548,7 +549,9 @@ launch_tunnel() {
 }
 
 launch_fortivpn() {
-    "$EXPECT_SCRIPT" "$OPENFORTIVPN" "$CONFIG_PATH" >> "$LOG_FILE" 2>&1 &
+    # shellcheck disable=SC2024  # redirect applies to the backgrounded helper job
+    printf '%s\n' "$VPN_PASSWORD" | sudo -n "$VPNCTL_HELPER" start-fortivpn \
+        "$EXPECT_SCRIPT" "$OPENFORTIVPN" "$CONFIG_PATH" "$TUNNEL_PID_FILE" >> "$LOG_FILE" 2>&1 &
     TUNNEL_PID=$!
     log "Launched fortivpn tunnel (expect pid $TUNNEL_PID)"
 }
@@ -563,7 +566,8 @@ launch_openvpn() {
     # shellcheck disable=SC2024  # redirect applies to this whole backgrounded
     # job (bash), not to sudo's own stdout — sudo runs fine as the privileged
     # child writing to the fd bash already opened before the fork.
-    sudo -n "$OPENVPN" --config "$OPENVPN_CONFIG_PATH" --auth-user-pass "$OPENVPN_AUTH_FILE" \
+    sudo -n "$VPNCTL_HELPER" start-openvpn "$OPENVPN" "$OPENVPN_CONFIG_PATH" \
+        "$OPENVPN_AUTH_FILE" "$TUNNEL_PID_FILE" \
         >> "$LOG_FILE" 2>&1 &
     TUNNEL_PID=$!
     log "Launched openvpn tunnel (pid $TUNNEL_PID)"
@@ -572,15 +576,12 @@ launch_openvpn() {
 # Used by the backgrounded monitor: never prompts (sudo -n), so it can't hang.
 teardown_tunnel() {
     if [ -n "$TUNNEL_PID" ] && kill -0 "$TUNNEL_PID" 2>/dev/null; then
-        # OpenVPN runs as root via sudo, so the unprivileged monitor may not be
-        # able to signal this wrapper. Do not wait here: the privileged pkill
-        # below is the authoritative teardown and must still run.
+        # The VPN runs as root via sudo, so the unprivileged monitor may not be
+        # able to signal this wrapper. The privileged helper is authoritative.
         kill "$TUNNEL_PID" 2>/dev/null
     fi
     TUNNEL_PID=""
-    if tunnel_running; then
-        sudo -n "$PKILL" -f "$ACTIVE_CONFIG" 2>/dev/null
-    fi
+    sudo -n "$VPNCTL_HELPER" stop "$TUNNEL_PID_FILE" 2>/dev/null || true
 }
 
 # ===========================================================================
@@ -681,7 +682,7 @@ do_stop() {
     # Fallback in case the monitor died uncleanly and left the tunnel up.
     if tunnel_running; then
         echo "Tearing down tunnel (may prompt for sudo password)..."
-        sudo "$PKILL" -f "$ACTIVE_CONFIG" 2>/dev/null
+        sudo "$VPNCTL_HELPER" stop "$TUNNEL_PID_FILE" 2>/dev/null
     fi
 }
 
@@ -939,10 +940,10 @@ do_doctor() {
         report fail "passwordless sudo for $VPN_TYPE missing/mismatched — run: $PROG install-sudoers"
     fi
 
-    if sudo_has_nopasswd "$PKILL -f $ACTIVE_CONFIG"; then
-        report ok "passwordless sudo for tunnel teardown (pkill)"
+    if sudo_has_nopasswd "$ACTIVE_STATUS_CMD" && sudo_has_nopasswd "$ACTIVE_STOP_CMD"; then
+        report ok "passwordless sudo for tunnel status and teardown (helper)"
     else
-        report fail "passwordless sudo for pkill missing — half-open recovery will need a password (run: $PROG install-sudoers)"
+        report fail "passwordless sudo for tunnel status/teardown missing — run: $PROG install-sudoers"
     fi
 
     echo
@@ -1191,12 +1192,14 @@ do_install_sudoers() {
     fi
     require_config || return 1
     validate_config_security "$ACTIVE_CONFIG" || return 1
+    require_privileged_path "$VPNCTL_HELPER" || return 1
+    require_privileged_path "$ACTIVE_BIN" || return 1
 
     if [ "$VPN_TYPE" = "openvpn" ]; then
         tmpl="$(find_asset vpncli-openvpn.sudoers.template)" || {
             echo "Error: openvpn sudoers template not found near $SCRIPT_DIR." >&2; return 1; }
 
-        for _p in "$OPENVPN" "$OPENVPN_CONFIG_PATH" "$OPENVPN_AUTH_FILE" "$PKILL"; do
+        for _p in "$VPNCTL_HELPER" "$OPENVPN" "$OPENVPN_CONFIG_PATH" "$OPENVPN_AUTH_FILE" "$TUNNEL_PID_FILE"; do
             case "$_p" in
                 *[[:space:]]*)
                     echo "Error: this path contains whitespace, which breaks passwordless-sudo matching:" >&2
@@ -1215,10 +1218,11 @@ do_install_sudoers() {
         tmp="$(mktemp "${TMPDIR:-/tmp}/vpncli.sudoers.XXXXXX")" || return 1
         render_template "$tmpl" \
             "__USER__=$(sudoers_escape "$USER")" \
+            "__HELPER__=$(sudoers_escape "$VPNCTL_HELPER")" \
             "__OPENVPN__=$(sudoers_escape "$OPENVPN")" \
             "__OVPN_CONFIG__=$(sudoers_escape "$OPENVPN_CONFIG_PATH")" \
             "__AUTH_FILE__=$(sudoers_escape "$OPENVPN_AUTH_FILE")" \
-            "__PKILL__=$(sudoers_escape "$PKILL")" \
+            "__PID_FILE__=$(sudoers_escape "$TUNNEL_PID_FILE")" \
             > "$tmp"
 
         if ! visudo -cf "$tmp" >/dev/null 2>&1; then
@@ -1232,12 +1236,13 @@ do_install_sudoers() {
         echo "  openvpn: $OPENVPN"
         echo "  config:  $OPENVPN_CONFIG_PATH"
         echo "  auth:    $OPENVPN_AUTH_FILE"
-        echo "  pkill:   $PKILL"
+        echo "  helper:  $VPNCTL_HELPER"
     else
+        require_privileged_path "$EXPECT_SCRIPT" || return 1
         tmpl="$(find_asset vpncli.sudoers.template)" || {
             echo "Error: sudoers template not found near $SCRIPT_DIR." >&2; return 1; }
 
-        for _p in "$OPENFORTIVPN" "$CONFIG_PATH" "$PKILL"; do
+        for _p in "$VPNCTL_HELPER" "$EXPECT_SCRIPT" "$OPENFORTIVPN" "$CONFIG_PATH" "$TUNNEL_PID_FILE"; do
             case "$_p" in
                 *[[:space:]]*)
                     echo "Error: this path contains whitespace, which breaks passwordless-sudo matching:" >&2
@@ -1250,9 +1255,11 @@ do_install_sudoers() {
         tmp="$(mktemp "${TMPDIR:-/tmp}/vpncli.sudoers.XXXXXX")" || return 1
         render_template "$tmpl" \
             "__USER__=$(sudoers_escape "$USER")" \
+            "__HELPER__=$(sudoers_escape "$VPNCTL_HELPER")" \
+            "__EXPECT__=$(sudoers_escape "$EXPECT_SCRIPT")" \
             "__OPENFORTIVPN__=$(sudoers_escape "$OPENFORTIVPN")" \
             "__CONFIG__=$(sudoers_escape "$CONFIG_PATH")" \
-            "__PKILL__=$(sudoers_escape "$PKILL")" \
+            "__PID_FILE__=$(sudoers_escape "$TUNNEL_PID_FILE")" \
             > "$tmp"
 
         if ! visudo -cf "$tmp" >/dev/null 2>&1; then
@@ -1265,7 +1272,7 @@ do_install_sudoers() {
         echo "  user:         $USER"
         echo "  openfortivpn: $OPENFORTIVPN"
         echo "  config:       $CONFIG_PATH"
-        echo "  pkill:        $PKILL"
+        echo "  helper:       $VPNCTL_HELPER"
     fi
 
     if sudo install -m 0440 "$tmp" "$ACTIVE_SUDOERS_PATH"; then
@@ -1408,7 +1415,7 @@ do_setup() {
 # ===========================================================================
 # Post-config resolution (needs the functions above)
 # ===========================================================================
-PKILL="$(command -v pkill 2>/dev/null || echo /usr/bin/pkill)"
+VPNCTL_HELPER="$(find_asset vpnctl-helper || true)"
 [ -z "$OPENFORTIVPN" ] && OPENFORTIVPN="$(detect_openfortivpn || true)"
 [ -z "$OPENVPN" ]      && OPENVPN="$(detect_openvpn || true)"
 EXPECT_SCRIPT="$(find_asset fortiVPN.expect || true)"
@@ -1420,16 +1427,21 @@ SECRET_BACKEND_RESOLVED="$(resolve_secret_backend || true)"
 # (not an inline block) so `do_switch` can recompute these after flipping
 # $VPN_TYPE at runtime, without forking a fresh process.
 resolve_active_backend() {
+    TUNNEL_PID_FILE="/var/run/vpncli-${USER}-${VPN_TYPE}.pid"
     case "$VPN_TYPE" in
         openvpn)
             ACTIVE_BIN="$OPENVPN"
             ACTIVE_CONFIG="$OPENVPN_CONFIG_PATH"
-            ACTIVE_LAUNCH_CMD="$OPENVPN --config $OPENVPN_CONFIG_PATH --auth-user-pass $OPENVPN_AUTH_FILE"
+            ACTIVE_LAUNCH_CMD="$VPNCTL_HELPER start-openvpn $OPENVPN $OPENVPN_CONFIG_PATH $OPENVPN_AUTH_FILE $TUNNEL_PID_FILE"
+            ACTIVE_STATUS_CMD="$VPNCTL_HELPER status $OPENVPN $OPENVPN_CONFIG_PATH $TUNNEL_PID_FILE"
+            ACTIVE_STOP_CMD="$VPNCTL_HELPER stop $TUNNEL_PID_FILE"
             ;;
         *)
             ACTIVE_BIN="$OPENFORTIVPN"
             ACTIVE_CONFIG="$CONFIG_PATH"
-            ACTIVE_LAUNCH_CMD="$OPENFORTIVPN -c $CONFIG_PATH"
+            ACTIVE_LAUNCH_CMD="$VPNCTL_HELPER start-fortivpn $EXPECT_SCRIPT $OPENFORTIVPN $CONFIG_PATH $TUNNEL_PID_FILE"
+            ACTIVE_STATUS_CMD="$VPNCTL_HELPER status $OPENFORTIVPN $CONFIG_PATH $TUNNEL_PID_FILE"
+            ACTIVE_STOP_CMD="$VPNCTL_HELPER stop $TUNNEL_PID_FILE"
             ;;
     esac
     # Suffixed per backend (vpncli-fortivpn / vpncli-openvpn) so both backends'

@@ -1,17 +1,17 @@
 # Passwordless sudo for vpnCLI (openvpn backend) — GENERATED, do not edit by hand.
 #
 # `vpnctl install-sudoers` renders this template with the values detected on
-# THIS machine (user, openvpn path, config path, auth-file path, pkill path)
+# THIS machine (user, helper, openvpn path, config path, auth-file path, pid path)
 # when VPN_TYPE=openvpn, and installs the result to the configured sudoers
 # path, suffixed for this backend (default /etc/sudoers.d/vpncli-openvpn —
 # see ACTIVE_SUDOERS_PATH), so it never clobbers the fortivpn backend's own
 # rule file, validated with `visudo -cf`.
 #
-# Passwordless sudo only applies to the EXACT command line below. Both lines
+# Passwordless sudo only applies to the EXACT command lines below. All commands
 # are rendered from the same paths the tool actually runs, so:
-#   - line 1 matches what vpnctl spawns to bring the tunnel up
-#     (openvpn --config <ovpn> --auth-user-pass <auth-file>), and
-#   - line 2 matches the pkill the monitor uses to tear a stale tunnel down.
+#   - the helper starts and supervises the VPN process,
+#   - status verifies the PID belongs to the expected VPN command, and
+#   - stop terminates only the PID recorded by the root-owned helper.
 # Because it is generated per machine, moving the repo can never desync it.
 #
 # The auth-file path is fixed (state dir) and its contents are rewritten fresh
@@ -22,6 +22,6 @@
 # Re-run `vpnctl install-sudoers` after changing the openvpn path or the
 # config location.
 
-__USER__ ALL=(root) NOPASSWD: __OPENVPN__ --config __OVPN_CONFIG__ --auth-user-pass __AUTH_FILE__
-__USER__ ALL=(root) NOPASSWD: __PKILL__ -f __OVPN_CONFIG__
-
+__USER__ ALL=(root) NOPASSWD: __HELPER__ start-openvpn __OPENVPN__ __OVPN_CONFIG__ __AUTH_FILE__ __PID_FILE__
+__USER__ ALL=(root) NOPASSWD: __HELPER__ status __OPENVPN__ __OVPN_CONFIG__ __PID_FILE__
+__USER__ ALL=(root) NOPASSWD: __HELPER__ stop __PID_FILE__

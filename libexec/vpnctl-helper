@@ -1,0 +1,80 @@
+#!/bin/sh
+#
+# Privileged VPN process helper. This file must be installed root-owned and
+# referenced by a narrowly scoped sudoers rule.
+
+set -eu
+
+command_name=${1:-}
+shift || true
+
+die() {
+    printf '%s\n' "vpnctl-helper: $*" >&2
+    exit 1
+}
+
+read_pid() {
+    pid=$(cat "$1" 2>/dev/null || true)
+    case "$pid" in
+        ''|*[!0-9]*) die "invalid pid file" ;;
+    esac
+    printf '%s\n' "$pid"
+}
+
+case "$command_name" in
+    start-fortivpn)
+        [ "$#" -eq 4 ] || die "invalid start-fortivpn arguments"
+        expect_script=$1
+        vpn_binary=$2
+        config=$3
+        pid_file=$4
+        IFS= read -r password || true
+        [ -n "$password" ] || die "empty VPN password"
+        mkdir -p "$(dirname "$pid_file")"
+        VPN_PASSWORD=$password
+        export VPN_PASSWORD
+        "$expect_script" "$vpn_binary" "$config" >/dev/null 2>&1 &
+        pid=$!
+        umask 077
+        printf '%s\n' "$pid" > "$pid_file"
+        wait "$pid"
+        rm -f "$pid_file"
+        ;;
+    start-openvpn)
+        [ "$#" -eq 4 ] || die "invalid start-openvpn arguments"
+        vpn_binary=$1
+        config=$2
+        auth_file=$3
+        pid_file=$4
+        mkdir -p "$(dirname "$pid_file")"
+        "$vpn_binary" --config "$config" --auth-user-pass "$auth_file" &
+        pid=$!
+        umask 077
+        printf '%s\n' "$pid" > "$pid_file"
+        wait "$pid"
+        rm -f "$pid_file"
+        ;;
+    status)
+        [ "$#" -eq 3 ] || die "invalid status arguments"
+        vpn_binary=$1
+        config=$2
+        pid_file=$3
+        pid=$(read_pid "$pid_file")
+        kill -0 "$pid" 2>/dev/null || exit 1
+        command_line=$(ps -o command= -p "$pid" 2>/dev/null || true)
+        case "$command_line" in
+            *"$vpn_binary"*"$config"*) exit 0 ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    stop)
+        [ "$#" -eq 1 ] || die "invalid stop arguments"
+        pid_file=$1
+        pid=$(read_pid "$pid_file")
+        kill "$pid" 2>/dev/null || true
+        rm -f "$pid_file"
+        ;;
+    *)
+        die "unknown command"
+        ;;
+esac

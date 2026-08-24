@@ -4,8 +4,8 @@
 #   ~/.config/vpncli/vpn.conf            (or $VPNCLI_CONFIG_DIR/vpn.conf)
 # `vpnctl setup` does this for you and can prompt for the values below.
 #
-# This file is the process fingerprint, too: the monitor finds the running
-# tunnel with `pgrep -f <this file's path>`, so it must be a stable, unique path.
+# This path is included in the helper's command-line identity check, so keep it
+# stable and unique; don't move VPNCLI_CONFIG_DIR while a tunnel is running.
 
 # VPN gateway hostname or IP.
 host = vpn.example.com

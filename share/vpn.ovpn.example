@@ -8,9 +8,8 @@
 # `vpnctl setup` (with VPN_TYPE=openvpn) copies this template there if no
 # config exists yet, and prompts for your auth-user-pass username.
 #
-# This file is also the process fingerprint: the monitor finds the running
-# tunnel with `pgrep -f <this file's path>`, so it must be a stable, unique
-# path — don't move VPNCLI_CONFIG_DIR while a tunnel is running.
+# This path is included in the helper's command-line identity check, so keep it
+# stable and unique — don't move VPNCLI_CONFIG_DIR while a tunnel is running.
 #
 # Username/password: vpnctl supplies these itself via a freshly generated
 # `--auth-user-pass <file>` on every launch (from the OS secret store), so do
@@ -43,4 +42,3 @@ remote-cert-tls server
 cipher AES-256-GCM
 auth SHA256
 verb 3
-

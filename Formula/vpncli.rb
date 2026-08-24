@@ -1,5 +1,5 @@
 class Vpncli < Formula
-  desc "Self-supervising VPN tunnel manager for openfortivpn or OpenVPN (CLI + monitor daemon)"
+  desc "Self-supervising VPN tunnel manager for openfortivpn or OpenVPN"
   homepage "https://github.com/010228lxz/vpncli"
   url "https://github.com/010228lxz/vpncli/archive/refs/tags/v0.1.2.tar.gz"
   sha256 "c0cad43a059913ed1bbf8155e4a80f28019e99b375cfde32e5361609f4125ac0"
@@ -12,7 +12,7 @@ class Vpncli < Formula
 
   def install
     bin.install "bin/vpnctl"
-    libexec.install "libexec/fortiVPN.expect"
+    libexec.install "libexec/fortiVPN.expect", "libexec/vpnctl-helper"
     pkgshare.install "share/vpn.conf.example", "share/vpn.ovpn.example",
                       "share/vpncli.sudoers.template", "share/vpncli-openvpn.sudoers.template"
   end
