@@ -15,8 +15,8 @@ repo; per-machine config and credentials are created by `vpnctl setup`.
 
 ```sh
 brew tap 010228lxz/vpncli https://github.com/010228lxz/vpncli
-brew install 010228lxz/vpncli/vpncli   # stable v0.1.0 (add --HEAD to track main instead)
-vpnctl setup                           # finish per-machine setup
+brew install 010228lxz/vpncli/vpncli   # stable v0.1.1 (add --HEAD to track main instead)
+vpnctl setup                           # finish per-machine setup (requires sudo)
 ```
 
 The explicit tap URL is needed because the repo is named `vpncli`, not
@@ -27,7 +27,7 @@ The explicit tap URL is needed because the repo is named `vpncli`, not
 
 ```sh
 git clone https://github.com/010228lxz/vpncli.git && cd vpncli
-./bin/vpnctl setup
+./bin/vpnctl setup                    # finish per-machine setup (requires sudo)
 # optionally symlink onto your PATH:
 ln -s "$PWD/bin/vpnctl" /usr/local/bin/vpnctl
 ```
@@ -37,8 +37,10 @@ ln -s "$PWD/bin/vpnctl" /usr/local/bin/vpnctl
 Pick one backend (set via `VPN_TYPE` — see Customization below):
 
 - **fortivpn** (default): `openfortivpn` (`brew install openfortivpn` / `apt install
-  openfortivpn`) + `expect` (preinstalled on macOS; `apt install expect` on Linux).
-- **openvpn**: `openvpn` (`brew install openvpn` / `apt install openvpn-client`).
+  openfortivpn`) + `expect` (preinstalled on macOS; `sudo apt install expect` on
+  Debian/Ubuntu).
+- **openvpn**: `openvpn` (`brew install openvpn` / `sudo apt install openvpn` on
+  Debian/Ubuntu).
   No `expect` needed — credentials are passed via a freshly generated
   `--auth-user-pass` file instead of an interactive prompt.
 
@@ -46,7 +48,14 @@ Either way, you also need a secret store: macOS **Keychain** (built in), or on
 Linux [`secret-tool`](https://wiki.gnome.org/Projects/Libsecret) (libsecret) or
 [`pass`](https://www.passwordstore.org/). Auto-detection prefers `secret-tool`
 only when a desktop session bus is present and otherwise falls back to `pass`,
-so it works on headless servers; force a choice with `SECRET_BACKEND`.
+so it works on headless servers; force a choice with `SECRET_BACKEND`. On
+Debian/Ubuntu, install these with `sudo apt install libsecret-tools` or
+`sudo apt install pass`, respectively. A new `pass` store also needs a GPG key
+and must be initialized with `pass init <GPG-key-id>`.
+
+`vpnctl setup` installs a passwordless-sudo rule for the exact VPN launch and
+teardown commands, so the setup user must be allowed to run `sudo`. Review the
+security notes before using it on a shared machine.
 
 ## Usage
 
@@ -88,12 +97,21 @@ provider (certs/keys embedded or referenced by absolute path) — don't put
 `auth-user-pass` or inline credentials in it; `vpnctl` supplies those itself.
 See `share/vpn.ovpn.example` for the expected shape.
 
+The example files contain placeholder gateway values and are not working VPN
+profiles. Obtain the real gateway, certificates/keys, and any provider-specific
+directives from your VPN administrator. Do not run `vpnctl start` until the
+placeholder config has been replaced and `vpnctl doctor` reports the required
+checks as passed. For FortiVPN, the gateway certificate fingerprint must also
+be filled in; for OpenVPN, referenced certificate/key paths must exist and be
+readable by the root-launched client.
+
 **macOS + openvpn caveat:** unlike `ppp0`/`tun0`, openvpn's `utun` interface name
 on macOS is assigned dynamically and isn't unique to this tool (other VPNs/OS
 features use `utun*` too), so tunnel-health detection is best-effort: it picks
 the first `utun*` with an address. If that's ambiguous on your machine, pin the
 exact interface with `TUN_IFACE=utun4` in `settings` once you know which one
 openvpn is actually using (check `vpnctl logs` or `ifconfig` after connecting).
+`vpnctl doctor` and `vpnctl setup` both warn about this until `TUN_IFACE` is set.
 
 ## Switching backends
 
@@ -282,3 +300,19 @@ rm -rf ~/.config/vpncli ~/.local/state/vpncli
 # credentials — see "Switching backends")
 brew uninstall vpncli   # if installed via Homebrew
 ```
+
+## Development
+
+No build step — `bin/vpnctl` is the whole tool. Before sending a PR:
+
+```sh
+shellcheck bin/vpnctl                  # brew install shellcheck / apt install shellcheck
+bats tests/vpnctl.bats                 # brew install bats-core / apt install bats
+```
+
+`tests/vpnctl.bats` unit-tests the pure/deterministic helpers (secret account naming,
+`file_kv_set`/`settings_set`, the sudoers template renderer, pid-reuse handling in
+`monitor_pid`, backend dispatch) by `source`-ing `bin/vpnctl` — it never touches a
+real secret store, sudo, or VPN binary. CI (`.github/workflows/ci.yml`) runs
+ShellCheck, the bats suite on Linux + macOS, and a Homebrew formula audit on every
+push/PR.

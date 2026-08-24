@@ -33,6 +33,10 @@ class Vpncli < Formula
         - openvpn:  needs `openvpn` too — install it yourself:
                       brew install openvpn
 
+      This formula installs the fortivpn backend and its `expect` helper as
+      baseline dependencies. OpenVPN users will have those extra packages
+      installed, but do not need to use them.
+
       Config lives in ~/.config/vpncli/ and logs/pid in ~/.local/state/vpncli/.
     EOS
   end
