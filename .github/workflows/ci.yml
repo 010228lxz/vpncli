@@ -46,8 +46,10 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: brew style + audit
+      - name: brew style
         run: |
           brew tap 010228lxz/vpncli "$GITHUB_WORKSPACE"
           brew style --formula 010228lxz/vpncli/vpncli
-          brew audit --strict 010228lxz/vpncli/vpncli || true
+
+      - name: brew audit
+        run: brew audit --strict --formula 010228lxz/vpncli/vpncli
