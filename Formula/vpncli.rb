@@ -1,8 +1,8 @@
 class Vpncli < Formula
   desc "Self-supervising VPN tunnel manager for openfortivpn or OpenVPN"
   homepage "https://github.com/010228lxz/vpncli"
-  url "https://github.com/010228lxz/vpncli/archive/refs/tags/v0.1.5.tar.gz"
-  sha256 "fad44db7cf931b57a6ed804a6433687d67645692978e6c9bf68a51248b215ef5"
+  url "https://github.com/010228lxz/vpncli/archive/refs/tags/0.1.6.tar.gz"
+  sha256 "8ff8e05432e07bd0885d0158885764ee8182814845af31509c2e4c35d4ac96c5"
   license "MIT"
   # Or track the default branch: brew install --HEAD 010228lxz/vpncli/vpncli
   head "https://github.com/010228lxz/vpncli.git", branch: "main"
