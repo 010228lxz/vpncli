@@ -86,9 +86,13 @@ EOF
 
 @test "helper rejects malformed pid files without executing kill" {
     pid_file="$TEST_TMP/bad.pid"
+    fake_vpn="$TEST_TMP/fake-openvpn"
+    config="$TEST_TMP/client.ovpn"
+    printf '# fake config\n' > "$config"
     printf 'not-a-pid\n' > "$pid_file"
-    run "$HELPER" stop "$pid_file"
+    run "$HELPER" stop "$fake_vpn" "$config" "$pid_file"
     [ "$status" -ne 0 ]
+    [[ "$output" == *"invalid pid file"* ]]
     [ -e "$pid_file" ]
 }
 
@@ -107,6 +111,25 @@ EOF
     [ "$status" -ne 0 ]
     kill -0 "$VPN_PID"
     [ -e "$pid_file" ]
+}
+
+@test "privileged helper stop refuses a stale PID reused by another process" {
+    command -v sudo >/dev/null 2>&1 || skip "sudo not available"
+    run sudo -n true
+    [ "$status" -eq 0 ] || skip "passwordless sudo not available"
+
+    fake_vpn="$TEST_TMP/fake-openvpn"
+    config="$TEST_TMP/client.ovpn"
+    pid_file="$TEST_TMP/vpn.pid"
+    printf '# fake config\n' > "$config"
+    sleep 30 &
+    VPN_PID="$!"
+    printf '%s\n' "$VPN_PID" > "$pid_file"
+    run sudo -n "$HELPER" stop "$fake_vpn" "$config" "$pid_file"
+    [ "$status" -ne 0 ]
+    kill -0 "$VPN_PID"
+    [ -e "$pid_file" ]
+    kill "$VPN_PID"
 }
 
 @test "sudoers renderer and visudo validate a disposable rule" {

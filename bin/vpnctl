@@ -650,11 +650,6 @@ launch_openvpn() {
 
 # Used by the backgrounded monitor: never prompts (sudo -n), so it can't hang.
 teardown_tunnel() {
-    if [ -n "$TUNNEL_PID" ] && kill -0 "$TUNNEL_PID" 2>/dev/null; then
-        # The VPN runs as root via sudo, so the unprivileged monitor may not be
-        # able to signal this wrapper. The privileged helper is authoritative.
-        kill "$TUNNEL_PID" 2>/dev/null
-    fi
     TUNNEL_PID=""
     sudo -n "$VPNCTL_HELPER" stop "$ACTIVE_BIN" "$ACTIVE_CONFIG" \
         "$TUNNEL_PID_FILE" 2>/dev/null || true
@@ -858,7 +853,8 @@ do_stop() {
     # Fallback in case the monitor died uncleanly and left the tunnel up.
     if tunnel_running; then
         echo "Tearing down tunnel (may prompt for sudo password)..."
-        sudo "$VPNCTL_HELPER" stop "$TUNNEL_PID_FILE" 2>/dev/null
+        sudo "$VPNCTL_HELPER" stop "$ACTIVE_BIN" "$ACTIVE_CONFIG" \
+            "$TUNNEL_PID_FILE" 2>/dev/null
     fi
 }
 

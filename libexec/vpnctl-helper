@@ -83,6 +83,9 @@ case "$command_name" in
         kill -0 "$pid" 2>/dev/null || die "VPN process is not running"
         process_matches "$pid" "$vpn_binary" "$config" ||
             die "VPN process identity mismatch"
+        # Re-check immediately before signaling to narrow the PID-reuse window.
+        process_matches "$pid" "$vpn_binary" "$config" ||
+            die "VPN process identity changed before stopping"
         kill "$pid" 2>/dev/null || die "failed to stop VPN process"
         rm -f "$pid_file"
         ;;
