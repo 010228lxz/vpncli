@@ -59,6 +59,7 @@ MONITOR_READY_FILE="$STATE_DIR/monitor.ready"
 # ---------------------------------------------------------------------------
 # Defaults (override any of these in $SETTINGS_FILE).
 # ---------------------------------------------------------------------------
+VERSION="0.1.15"
 VPN_TYPE="fortivpn"                   # fortivpn | openvpn — which backend to drive
 OPENFORTIVPN=""                       # empty → auto-detect
 OPENVPN=""                            # empty → auto-detect (openvpn backend)
@@ -151,8 +152,22 @@ validate_settings() {
     done
 }
 
+print_banner() {
+    cat <<EOF
+ _ __  __ _ __   __ ___| |  ___
+| '_ \/ _\` |\ \ / /|  __| | / _ \\
+| |_) | (_| | \ V / | |__| ||  __/
+| .__/ \__,_|  \_/  \___|_| \___|
+|_|
+vpnctl — self-supervising VPN tunnel manager
+Version: $VERSION
+EOF
+}
+
 usage() {
     cat <<EOF
+$(print_banner)
+
 Usage: $PROG <command>
 
   start              Start the background monitor (auto-reconnecting tunnel)
@@ -183,6 +198,7 @@ Usage: $PROG <command>
   uninstall-sudoers [--all]
                      Remove the active backend's passwordless-sudo rule
                      (--all removes both backends' rules)
+  version             Show the current version
 
 Config:  $CONFIG_PATH  (openvpn: $OPENVPN_CONFIG_PATH)
 State:   $STATE_DIR
@@ -1752,6 +1768,12 @@ resolve_active_backend() {
 resolve_active_backend
 
 if [ "$VPNCTL_SOURCED" -eq 0 ]; then
+    case "${1:-}" in
+        -v|--version|version)
+            printf '%s %s\n' "$PROG" "$VERSION"
+            exit 0
+            ;;
+    esac
     if [ "${1:-}" != "setup" ] && ! validate_settings; then
         exit 1
     fi

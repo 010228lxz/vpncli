@@ -30,6 +30,21 @@ teardown() {
     [ "$VPNCTL_SOURCED" -eq 1 ]
 }
 
+@test "usage includes the title logo and version" {
+    run "$VPNCTL"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"vpnctl — self-supervising VPN tunnel manager"* ]]
+    [[ "$output" == *"Version: 0.1.15"* ]]
+    [[ "$output" == *"Usage: vpnctl <command>"* ]]
+}
+
+@test "version command prints the current version without configuration checks" {
+    VPN_TYPE=invalid
+    run "$VPNCTL" --version
+    [ "$status" -eq 0 ]
+    [ "$output" = "vpnctl 0.1.15" ]
+}
+
 # --- secret_account / secret_account_legacy (per-backend scoping) ----------
 
 @test "secret_account scopes the password account to VPN_TYPE" {
