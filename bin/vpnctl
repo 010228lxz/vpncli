@@ -1369,7 +1369,7 @@ prompt_openvpn_config() {
 }
 
 install_privileged_assets() {
-    local asset_dir="/usr/local/libexec/vpncli" source target
+    local asset_dir="/usr/local/libexec/vpncli" target
     [ -n "$VPNCTL_HELPER" ] || {
         echo "Error: vpnctl-helper was not found near $SCRIPT_DIR." >&2
         return 1
