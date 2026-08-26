@@ -7,8 +7,10 @@ class Vpncli < Formula
   # Or track the default branch: brew install --HEAD 010228lxz/vpncli/vpncli
   head "https://github.com/010228lxz/vpncli.git", branch: "main"
 
-  depends_on "expect"
-  depends_on "openfortivpn"
+  # The VPN backends are mutually exclusive at runtime. Keep both optional so
+  # OpenVPN users do not receive the FortiVPN-only tools (and vice versa).
+  depends_on "expect" => :optional
+  depends_on "openfortivpn" => :optional
 
   def install
     bin.install "bin/vpnctl"
@@ -29,13 +31,13 @@ class Vpncli < Formula
 
       Two backends are supported, chosen via VPN_TYPE in
       ~/.config/vpncli/settings (default: fortivpn):
-        - fortivpn: needs `openfortivpn` (installed as a dependency above).
-        - openvpn:  needs `openvpn` too — install it yourself:
+        - fortivpn: install its optional runtime dependencies:
+                      brew install openfortivpn expect
+        - openvpn: install its runtime dependency:
                       brew install openvpn
 
-      This formula installs the fortivpn backend and its `expect` helper as
-      baseline dependencies. OpenVPN users will have those extra packages
-      installed, but do not need to use them.
+      Backend dependencies are optional in this formula so installing vpncli
+      does not pull in an unrelated VPN client or password-prompt helper.
 
       Config lives in ~/.config/vpncli/ and logs/pid in ~/.local/state/vpncli/.
       For passwordless sudo, Homebrew's user-owned OpenVPN and vpnctl-helper

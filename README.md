@@ -19,6 +19,14 @@ brew install 010228lxz/vpncli/vpncli   # stable v0.1.6 (add --HEAD to track main
 vpnctl setup                           # finish per-machine setup (requires sudo)
 ```
 
+Install the runtime dependency for the backend you use; the formula keeps
+backend dependencies optional so OpenVPN users do not install FortiVPN tools:
+
+```sh
+brew install openvpn                 # OpenVPN backend
+brew install openfortivpn expect     # fortivpn backend
+```
+
 The explicit tap URL is needed because the repo is named `vpncli`, not
 `homebrew-vpncli` — Homebrew's short `brew tap <user>/<name>` form assumes the
 `homebrew-` prefix.
