@@ -466,12 +466,23 @@ file_size() {
 # listing instead names NOPASSWD entries explicitly, and (under the default
 # listpw=any) prints without a password whenever any NOPASSWD rule exists.
 sudo_has_nopasswd() {
-    local want="$*" haystack
-    haystack="$(sudo -n -l 2>/dev/null | tr '\n' ' ' | tr -s ' ') "
-    case "$haystack" in
-        *"NOPASSWD: $want "*) return 0 ;;
-        *)                    return 1 ;;
-    esac
+    local want="$*" escaped line spec
+    escaped="$(sudoers_escape "$want")"
+    while IFS= read -r line; do
+        case "$line" in
+            *NOPASSWD:*)
+                spec="${line#*NOPASSWD:}"
+                spec="${spec#"${spec%%[![:space:]]*}"}"
+                spec="${spec%"${spec##*[![:space:]]}"}"
+                # sudo -l may print the sudoers-escaped command spec. Compare
+                # both forms, but require the complete listing line to match.
+                if [ "$spec" = "$want" ] || [ "$spec" = "$escaped" ]; then
+                    return 0
+                fi
+                ;;
+        esac
+    done < <(sudo -n -l 2>/dev/null)
+    return 1
 }
 
 # True only if $1 is alive AND its command line contains our exact monitor

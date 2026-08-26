@@ -119,6 +119,22 @@ teardown() {
     [ "$status" -eq 0 ]
 }
 
+@test "sudo_has_nopasswd requires an exact command spec" {
+    sudo() {
+        printf '%s\n' 'User may run the following commands on host:' \
+            '    (root) NOPASSWD: /usr/bin/helper status /var/run/vpn.pid --extra'
+    }
+    ! sudo_has_nopasswd '/usr/bin/helper status /var/run/vpn.pid'
+}
+
+@test "sudo_has_nopasswd accepts sudoers-escaped command specs" {
+    sudo() {
+        printf '%s\n' 'User may run the following commands on host:' \
+            '    (root) NOPASSWD: /usr/bin/helper status /tmp/vpn\=pid'
+    }
+    sudo_has_nopasswd '/usr/bin/helper status /tmp/vpn=pid'
+}
+
 # --- monitor_pid / _pid_is_monitor (pid-reuse hardening) --------------------
 
 @test "monitor_pid fails when PID_FILE is absent" {
