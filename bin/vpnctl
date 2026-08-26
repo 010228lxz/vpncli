@@ -1368,6 +1368,29 @@ prompt_openvpn_config() {
     fi
 }
 
+repair_secret_backend() {
+    local ans
+    case "${SECRET_BACKEND:-}" in
+        auto|security|secret-tool|pass)
+            SECRET_BACKEND_RESOLVED="$(resolve_secret_backend || true)"
+            return 0
+            ;;
+    esac
+
+    echo "Invalid SECRET_BACKEND in $SETTINGS_FILE: ${SECRET_BACKEND:-unset}"
+    echo "Choose a supported secret backend to continue setup:"
+    printf '  [1] auto (recommended)  [2] security  [3] secret-tool  [4] pass  [Enter = auto] '
+    read -r ans
+    case "$ans" in
+        2) SECRET_BACKEND="security" ;;
+        3) SECRET_BACKEND="secret-tool" ;;
+        4) SECRET_BACKEND="pass" ;;
+        *) SECRET_BACKEND="auto" ;;
+    esac
+    settings_set SECRET_BACKEND "$SECRET_BACKEND" || return 1
+    SECRET_BACKEND_RESOLVED="$(resolve_secret_backend || true)"
+}
+
 install_privileged_assets() {
     local asset_dir="/usr/local/libexec/vpncli" target
     [ -n "$VPNCTL_HELPER" ] || {
@@ -1551,6 +1574,7 @@ do_setup() {
     local c imported cand ex ans
     echo "vpnCLI setup"
     echo
+    repair_secret_backend || return 1
     if ! case "${VPN_TYPE:-}" in fortivpn|openvpn) true ;; *) false ;; esac; then
         echo "Invalid VPN_TYPE in $SETTINGS_FILE; defaulting to fortivpn for setup."
         VPN_TYPE="fortivpn"

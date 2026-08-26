@@ -246,6 +246,15 @@ teardown() {
     [ "$status" -eq 0 ]
 }
 
+@test "setup repairs an invalid secret backend before password setup" {
+    SECRET_BACKEND=keychain
+    SETTINGS_FILE="$TEST_TMP/settings"
+    CONFIG_DIR="$TEST_TMP"
+    OS=Linux
+    printf '\n' | repair_secret_backend
+    [[ "$(cat "$SETTINGS_FILE")" == *"SECRET_BACKEND=auto"* ]]
+}
+
 # --- resolve_active_backend --------------------------------------------------
 
 @test "resolve_active_backend computes distinct sudoers paths per backend" {
