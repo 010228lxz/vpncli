@@ -60,6 +60,7 @@ VPN_TYPE="fortivpn"                   # fortivpn | openvpn — which backend to 
 OPENFORTIVPN=""                       # empty → auto-detect
 OPENVPN=""                            # empty → auto-detect (openvpn backend)
 OPENVPN_USERNAME=""                   # openvpn auth-user-pass username (openvpn backend)
+VPNCTL_HELPER=""                      # optional root-owned helper override
 TUN_IFACE=""                          # pin the tunnel iface name (openvpn on macOS: utun names are assigned dynamically and can't be scoped as precisely as ppp*/tun*; set e.g. TUN_IFACE=utun4)
 SECRET_SERVICE="vpncli"               # secret store service/account label
 SECRET_BACKEND="auto"                 # auto | security | secret-tool | pass
@@ -1077,7 +1078,12 @@ file_kv_set() {
     if [ "$found" -eq 0 ]; then
         printf '%s = %s\n' "$key" "$val" >> "$tmp"
     fi
-    mv "$tmp" "$file"
+    if [ -w "$(dirname "$file")" ] && { [ ! -e "$file" ] || [ -w "$file" ]; }; then
+        mv "$tmp" "$file"
+    else
+        sudo install -o root -m 600 "$tmp" "$file"
+        rm -f "$tmp"
+    fi
 }
 
 conf_set() {
@@ -1104,8 +1110,13 @@ settings_set() {
     if [ "$found" -eq 0 ]; then
         printf '%s=%q\n' "$key" "$val" >> "$tmp"
     fi
-    mv "$tmp" "$SETTINGS_FILE"
-    chmod 600 "$SETTINGS_FILE" 2>/dev/null
+    if [ -w "$CONFIG_DIR" ] && { [ ! -e "$SETTINGS_FILE" ] || [ -w "$SETTINGS_FILE" ]; }; then
+        mv "$tmp" "$SETTINGS_FILE"
+        chmod 600 "$SETTINGS_FILE" 2>/dev/null
+    else
+        sudo install -o root -m 600 "$tmp" "$SETTINGS_FILE"
+        rm -f "$tmp"
+    fi
 }
 
 # Escapes characters that are special inside a sudoers command spec: `*?[]`
@@ -1180,6 +1191,59 @@ prompt_openvpn_config() {
         echo "  TUN_IFACE=utunN   in $SETTINGS_FILE"
         echo "('vpnctl doctor' will keep warning about this until TUN_IFACE is set.)"
     fi
+}
+
+install_privileged_assets() {
+    local asset_dir="/usr/local/libexec/vpncli" source target
+    [ -n "$VPNCTL_HELPER" ] || {
+        echo "Error: vpnctl-helper was not found near $SCRIPT_DIR." >&2
+        return 1
+    }
+    [ -n "$ACTIVE_BIN" ] || return 0
+
+    echo "Installing root-owned VPN runtime files (requires sudo)..."
+    sudo install -d -o root -m 755 "$asset_dir"
+    target="$asset_dir/$(basename "$ACTIVE_BIN")"
+    sudo install -o root -m 755 "$ACTIVE_BIN" "$target"
+    ACTIVE_BIN="$target"
+    case "$VPN_TYPE" in
+        openvpn) OPENVPN="$target" ;;
+        *)       OPENFORTIVPN="$target" ;;
+    esac
+    settings_set "$([ "$VPN_TYPE" = "openvpn" ] && echo OPENVPN || echo OPENFORTIVPN)" "$target"
+
+    target="$asset_dir/vpnctl-helper"
+    sudo install -o root -m 755 "$VPNCTL_HELPER" "$target"
+    VPNCTL_HELPER="$target"
+    settings_set VPNCTL_HELPER "$target"
+
+    if [ "$VPN_TYPE" = "fortivpn" ] && [ -n "$EXPECT_SCRIPT" ]; then
+        target="$asset_dir/fortiVPN.expect"
+        sudo install -o root -m 755 "$EXPECT_SCRIPT" "$target"
+        EXPECT_SCRIPT="$target"
+        settings_set EXPECT_SCRIPT "$target"
+    fi
+    resolve_active_backend
+}
+
+move_config_to_privileged_dir() {
+    local source_dir="$CONFIG_DIR" target_dir="/etc/vpncli" file
+    case "$source_dir" in
+        "$HOME"/*) ;;
+        *) return 0 ;;
+    esac
+
+    echo "Moving VPN configuration to $target_dir (requires sudo)..."
+    sudo install -d -o root -m 755 "$target_dir"
+    for file in vpn.conf vpn.ovpn settings; do
+        if [ -f "$source_dir/$file" ]; then
+            sudo install -o root -m 644 "$source_dir/$file" "$target_dir/$file"
+        fi
+    done
+    CONFIG_DIR="$target_dir"
+    CONFIG_PATH="$CONFIG_DIR/vpn.conf"
+    SETTINGS_FILE="$CONFIG_DIR/settings"
+    OPENVPN_CONFIG_PATH="$CONFIG_DIR/vpn.ovpn"
 }
 
 do_install_sudoers() {
@@ -1312,6 +1376,7 @@ do_setup() {
     local c imported cand ex ans
     echo "vpnCLI setup"
     echo
+    move_config_to_privileged_dir || return 1
     mkdir -p "$CONFIG_DIR" "$STATE_DIR"
     chmod 700 "$CONFIG_DIR" "$STATE_DIR" 2>/dev/null   # tighten if dirs pre-existed
 
@@ -1333,7 +1398,23 @@ do_setup() {
     resolve_active_backend
     echo
 
+    install_privileged_assets || return 1
+
     # 1. Config
+    case "$CONFIG_DIR" in
+        "$HOME"/*)
+            echo "Note: passwordless sudo requires the VPN config and every parent directory"
+            echo "to be root-owned, readable by vpnctl, and not group/world-writable."
+            echo "For the sudoers step, move the finished config to /etc/vpncli and set"
+            echo "VPNCLI_CONFIG_DIR=/etc/vpncli in the environment, or run setup with that"
+            echo "location already prepared."
+            echo ;;
+    esac
+    echo "Note: passwordless sudo also requires the VPN executable and vpnctl-helper"
+    echo "to be root-owned. Homebrew installs them in user-owned locations, so copy"
+    echo "them to a protected path and set OPENVPN and VPNCTL_HELPER in settings"
+    echo "before the sudoers step (see the README for the exact commands)."
+    echo
     if [ "$VPN_TYPE" = "openvpn" ]; then
         if [ -r "$OPENVPN_CONFIG_PATH" ]; then
             echo "Config already present: $OPENVPN_CONFIG_PATH"
@@ -1415,7 +1496,9 @@ do_setup() {
 # ===========================================================================
 # Post-config resolution (needs the functions above)
 # ===========================================================================
-VPNCTL_HELPER="$(find_asset vpnctl-helper || true)"
+if [ -z "$VPNCTL_HELPER" ]; then
+    VPNCTL_HELPER="$(find_asset vpnctl-helper || true)"
+fi
 [ -z "$OPENFORTIVPN" ] && OPENFORTIVPN="$(detect_openfortivpn || true)"
 [ -z "$OPENVPN" ]      && OPENVPN="$(detect_openvpn || true)"
 EXPECT_SCRIPT="$(find_asset fortiVPN.expect || true)"

@@ -38,6 +38,9 @@ class Vpncli < Formula
       installed, but do not need to use them.
 
       Config lives in ~/.config/vpncli/ and logs/pid in ~/.local/state/vpncli/.
+      For passwordless sudo, Homebrew's user-owned OpenVPN and vpnctl-helper
+      must be copied to a root-owned path. See the README security instructions
+      before running `vpnctl install-sudoers`.
     EOS
   end
 

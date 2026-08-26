@@ -54,17 +54,28 @@ Debian/Ubuntu, install these with `sudo apt install libsecret-tools` or
 and must be initialized with `pass init <GPG-key-id>`.
 
 `vpnctl setup` installs a passwordless-sudo rule for the exact VPN launch and
-teardown commands, so the setup user must be allowed to run `sudo`. Review the
-security notes before using it on a shared machine.
+teardown commands, so the setup user must be allowed to run `sudo`. When the
+default config directory is used, setup moves the config to `/etc/vpncli`,
+installs root-owned runtime copies of the VPN executable and helper, and
+configures their paths automatically. Review the security notes before using it
+on a shared machine.
 
 For passwordless sudo, the active VPN config and every parent directory must be
 root-owned and not writable by group or other users. The config must also avoid
 external script/plugin directives (`up`, `down`, `plugin`, `route-up`, and
 similar), because those would otherwise provide root code execution. A common
 secure layout is `/etc/vpncli/`; create or copy the provider config there and
-set `VPNCLI_CONFIG_DIR=/etc/vpncli` in `settings` before running
+set `VPNCLI_CONFIG_DIR=/etc/vpncli` in the environment before running
 `vpnctl install-sudoers`. If you keep the default user-writable config under
 `~/.config/vpncli`, `install-sudoers` will refuse to create the rule.
+
+For an existing setup, run `vpnctl setup`; it moves both backend configs and
+`settings` into the root-owned directory and preserves the existing values.
+The invoking user must still be able to read them.
+
+Homebrew users only need to run `vpnctl setup`; it performs the protected copy
+and then installs sudoers. Re-run setup after upgrading either package so the
+root-owned runtime copies are refreshed.
 
 ## Usage
 
@@ -96,12 +107,12 @@ Set `VPN_TYPE` in `~/.config/vpncli/settings` (or answer the prompt in
 | | `VPN_TYPE=fortivpn` (default) | `VPN_TYPE=openvpn` |
 |---|---|---|
 | Binary | `openfortivpn` | `openvpn` |
-| Config file | `~/.config/vpncli/vpn.conf` (key=value) | `~/.config/vpncli/vpn.ovpn` (provider-supplied) |
+| Config file | `${VPNCLI_CONFIG_DIR:-~/.config/vpncli}/vpn.conf` (key=value) | `${VPNCLI_CONFIG_DIR:-~/.config/vpncli}/vpn.ovpn` (provider-supplied) |
 | Password delivery | `expect` answers the VPN password prompt | `--auth-user-pass <file>`, regenerated fresh on every launch |
 | Username | `username =` line in `vpn.conf` | `OPENVPN_USERNAME` in `settings` |
 | Tunnel interface | `ppp0` (pppd) | `tun0` (Linux) / `utun*` (macOS — see caveat below) |
 
-For openvpn, `~/.config/vpncli/vpn.ovpn` is a real client config from your VPN
+For openvpn, `${VPNCLI_CONFIG_DIR:-~/.config/vpncli}/vpn.ovpn` is a real client config from your VPN
 provider (certs/keys embedded or referenced by absolute path) — don't put
 `auth-user-pass` or inline credentials in it; `vpnctl` supplies those itself.
 See `share/vpn.ovpn.example` for the expected shape.
@@ -222,7 +233,7 @@ reports whether a TOTP seed is configured. Remove it with
 
 ## Customization
 
-Drop a `settings` file next to your config (`~/.config/vpncli/settings`) to
+Drop a `settings` file next to your config (`${VPNCLI_CONFIG_DIR:-~/.config/vpncli}/settings`) to
 override any default without editing code; it's sourced by `vpnctl`:
 
 ```sh
@@ -230,6 +241,7 @@ VPN_TYPE=fortivpn                           # fortivpn | openvpn
 OPENFORTIVPN=/usr/local/bin/openfortivpn     # default: auto-detected
 OPENVPN=/usr/local/sbin/openvpn              # default: auto-detected (openvpn backend)
 OPENVPN_USERNAME=your.username               # auth-user-pass username (openvpn backend)
+VPNCTL_HELPER=/usr/local/libexec/vpncli/vpnctl-helper  # root-owned helper for sudoers
 TUN_IFACE=                                   # pin the tunnel iface (openvpn on macOS)
 SECRET_SERVICE=vpncli                       # secret store service/account label
 SECRET_BACKEND=auto                         # auto | security | secret-tool | pass
