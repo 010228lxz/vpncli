@@ -15,7 +15,7 @@ repo; per-machine config and credentials are created by `vpnctl setup`.
 
 ```sh
 brew tap 010228lxz/vpncli https://github.com/010228lxz/vpncli
-brew install 010228lxz/vpncli/vpncli   # stable v0.1.8 (add --HEAD to track main instead)
+brew install 010228lxz/vpncli/vpncli   # stable v0.1.15 (add --HEAD to track main instead)
 vpnctl setup                           # finish per-machine setup (requires sudo)
 ```
 
@@ -44,7 +44,7 @@ ln -s "$PWD/bin/vpnctl" /usr/local/bin/vpnctl
 
 Pick one backend (set via `VPN_TYPE` — see Customization below):
 
-- **fortivpn** (default): `openfortivpn` (`brew install openfortivpn` / `apt install
+- **fortivpn** (default): `openfortivpn` (`brew install openfortivpn` / `sudo apt install
   openfortivpn`) + `expect` (preinstalled on macOS; `sudo apt install expect` on
   Debian/Ubuntu).
 - **openvpn**: `openvpn` (`brew install openvpn` / `sudo apt install openvpn` on
@@ -329,12 +329,18 @@ shared service user), treat the config as privileged — make it root-owned and
 not writable by that account:
 
 ```sh
-sudo chown root ~/.config/vpncli/vpn.conf    # fortivpn backend
-sudo chmod 644  ~/.config/vpncli/vpn.conf    # edit later with sudo
+sudo install -d -o root -m 755 /etc/vpncli
+sudo install -o root -m 644 ~/.config/vpncli/settings /etc/vpncli/settings
+sudo install -o root -m 644 ~/.config/vpncli/vpn.conf /etc/vpncli/vpn.conf
 # or, for the openvpn backend:
-sudo chown root ~/.config/vpncli/vpn.ovpn
-sudo chmod 644  ~/.config/vpncli/vpn.ovpn
+sudo install -o root -m 644 ~/.config/vpncli/vpn.ovpn /etc/vpncli/vpn.ovpn
+export VPNCLI_CONFIG_DIR=/etc/vpncli
+vpnctl install-sudoers
 ```
+
+`vpnctl setup` performs this move automatically when it starts with the default
+user config directory. If you prepare the directory manually, keep every parent
+directory root-owned and run `install-sudoers` with `VPNCLI_CONFIG_DIR=/etc/vpncli`.
 
 The secret store and `set-password` are unaffected by this.
 
