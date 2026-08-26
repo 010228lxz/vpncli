@@ -52,6 +52,9 @@ CONFIG_PATH="$CONFIG_DIR/vpn.conf"
 SETTINGS_FILE="$CONFIG_DIR/settings"
 LOG_FILE="$STATE_DIR/vpn.log"
 PID_FILE="$STATE_DIR/vpn.pid"
+MONITOR_LOCK_DIR="$STATE_DIR/monitor.lock"
+MONITOR_OWNER_FILE="$MONITOR_LOCK_DIR/owner"
+MONITOR_READY_FILE="$STATE_DIR/monitor.ready"
 
 # ---------------------------------------------------------------------------
 # Defaults (override any of these in $SETTINGS_FILE).
@@ -69,6 +72,7 @@ INTERVAL=10                           # seconds between health checks
 CONNECT_GRACE=20                      # seconds to let a fresh tunnel come up
 HALF_OPEN_CHECKS=3                    # "process up, no tunnel iface" checks before reconnect
 MAX_LOG_BYTES=1048576                 # rotate vpn.log past 1 MB
+STARTUP_TIMEOUT=30                     # seconds to wait for monitor readiness
 SUDOERS_PATH="/etc/sudoers.d/vpncli"  # where the generated rule is installed
 
 if [ -f "$SETTINGS_FILE" ]; then
@@ -84,6 +88,7 @@ OPENVPN_CONFIG_PATH="$CONFIG_DIR/vpn.ovpn"
 OPENVPN_AUTH_FILE="$STATE_DIR/openvpn.auth"
 
 TUNNEL_PID=""
+MONITOR_TOKEN=""
 
 # ===========================================================================
 # Helpers
@@ -585,22 +590,103 @@ teardown_tunnel() {
     sudo -n "$VPNCTL_HELPER" stop "$TUNNEL_PID_FILE" 2>/dev/null || true
 }
 
+write_monitor_state() {
+    local path="$1" value="$2" tmp
+    tmp="${path}.$$"
+    printf '%s\n' "$value" > "$tmp" && mv -f "$tmp" "$path"
+}
+
+monitor_lock_owned() {
+    [ -n "$MONITOR_TOKEN" ] &&
+        [ -f "$MONITOR_OWNER_FILE" ] &&
+        [ "$(awk '{print $1}' "$MONITOR_OWNER_FILE" 2>/dev/null)" = "$MONITOR_TOKEN" ]
+}
+
+cleanup_monitor_state() {
+    monitor_lock_owned || return 0
+    rm -f "$PID_FILE" "$MONITOR_READY_FILE" "$MONITOR_OWNER_FILE"
+    rmdir "$MONITOR_LOCK_DIR" 2>/dev/null || true
+}
+
+monitor_lock_is_stale() {
+    [ -d "$MONITOR_LOCK_DIR" ] || return 1
+    local owner_pid started now
+    read -r _ owner_pid started < "$MONITOR_OWNER_FILE" 2>/dev/null || return 0
+    [[ "$owner_pid" =~ ^[0-9]+$ && "$started" =~ ^[0-9]+$ ]] || return 0
+    now="$(date +%s)"
+    [ "$now" -ge "$started" ] && [ $((now - started)) -ge "$STARTUP_TIMEOUT" ] || return 1
+    # Once the startup window has elapsed, trust the monitor PID identity rather
+    # than the launcher's PID, which may have been reused by another process.
+    monitor_pid && return 1
+    return 0
+}
+
+acquire_monitor_lock() {
+    mkdir -p "$STATE_DIR" || return 1
+    if mkdir "$MONITOR_LOCK_DIR" 2>/dev/null; then
+        MONITOR_TOKEN="$(date +%s)-$$-$RANDOM"
+        write_monitor_state "$MONITOR_OWNER_FILE" "$MONITOR_TOKEN $$ $(date +%s)"
+        return 0
+    fi
+    if monitor_pid; then
+        return 2
+    fi
+    if monitor_lock_is_stale; then
+        log "Recovering stale monitor state"
+        sudo -n "$VPNCTL_HELPER" stop "$TUNNEL_PID_FILE" 2>/dev/null || true
+        rm -f "$PID_FILE" "$MONITOR_READY_FILE"
+        rm -f "$MONITOR_OWNER_FILE"
+        rmdir "$MONITOR_LOCK_DIR" 2>/dev/null || return 1
+        acquire_monitor_lock
+        return $?
+    fi
+    return 2
+}
+
+wait_for_monitor_ready() {
+    local token="$1" pid="$2" elapsed=0 state
+    while [ "$elapsed" -lt "$STARTUP_TIMEOUT" ]; do
+        if [ -f "$MONITOR_READY_FILE" ]; then
+            read -r state _ ready_pid < "$MONITOR_READY_FILE" 2>/dev/null || true
+            if [ "$state" = "$token" ] && [ "$ready_pid" = "$pid" ]; then
+                return 0
+            fi
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 1
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    return 1
+}
+
 # ===========================================================================
 # Monitor daemon
 # ===========================================================================
 run_monitor() {
-    trap 'log "Stop signal received — tearing down"; teardown_tunnel; rm -f "$PID_FILE"; exit 0' TERM INT
+    MONITOR_TOKEN="${2:-}"
+    if [ -z "$MONITOR_TOKEN" ] || ! monitor_lock_owned; then
+        log "Exiting: monitor startup lock is not owned"
+        return 1
+    fi
+    trap 'exit 0' TERM INT
+    trap 'teardown_tunnel; cleanup_monitor_state' EXIT
+    write_monitor_state "$MONITOR_OWNER_FILE" "$MONITOR_TOKEN $$ $(date +%s)"
+    printf '%s\n' "$$" > "$PID_FILE"
 
     if [ -z "$ACTIVE_BIN" ]; then
-        log "Exiting: $VPN_TYPE binary not found"; rm -f "$PID_FILE"; exit 1
+        log "Exiting: $VPN_TYPE binary not found"; return 1
     fi
     if [ "$VPN_TYPE" = "openvpn" ] && [ -z "$OPENVPN_USERNAME" ]; then
-        log "Exiting: OPENVPN_USERNAME not set"; rm -f "$PID_FILE"; exit 1
+        log "Exiting: OPENVPN_USERNAME not set"; return 1
     fi
     if ! secret_present password; then
         log "Exiting: no VPN password in the secret store ($SECRET_BACKEND_RESOLVED:$SECRET_SERVICE)"
-        rm -f "$PID_FILE"; exit 1
+        return 1
     fi
+    write_monitor_state "$MONITOR_READY_FILE" "$MONITOR_TOKEN ready $$"
+    log "Monitor ready (pid $$)"
 
     local streak=0
     while true; do
@@ -632,7 +718,7 @@ run_monitor() {
 # Subcommands
 # ===========================================================================
 do_start() {
-    local pid newpid
+    local pid newpid token
     if pid="$(monitor_pid)"; then
         echo "Already running (monitor pid $pid)"
         return 0
@@ -658,12 +744,31 @@ do_start() {
         return 1
     fi
 
+    acquire_monitor_lock
+    case "$?" in
+        0) ;;
+        2)
+            echo "Already running or starting" >&2
+            return 0
+            ;;
+        *)
+            echo "Error: could not acquire monitor startup lock" >&2
+            return 1
+            ;;
+    esac
+    token="$MONITOR_TOKEN"
     rotate_log
     mkdir -p "$STATE_DIR"
-    nohup "$SELF" __run__ >> "$LOG_FILE" 2>&1 &
+    nohup "$SELF" __run__ "$token" >> "$LOG_FILE" 2>&1 &
     newpid=$!
     disown 2>/dev/null || true
-    echo "$newpid" > "$PID_FILE"
+    if ! wait_for_monitor_ready "$token" "$newpid"; then
+        echo "Error: monitor failed to become ready; see $LOG_FILE" >&2
+        if kill -0 "$newpid" 2>/dev/null; then
+            kill "$newpid" 2>/dev/null || true
+        fi
+        return 1
+    fi
     log "Monitor started (pid $newpid)"
     echo "Started (monitor pid $newpid)"
 }

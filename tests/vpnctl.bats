@@ -159,6 +159,28 @@ teardown() {
     kill "$fake_pid" 2>/dev/null
 }
 
+# --- monitor startup lock / readiness ----------------------------------------
+
+@test "acquire_monitor_lock is atomic and records an owner token" {
+    acquire_monitor_lock
+    [ -d "$MONITOR_LOCK_DIR" ]
+    [ "$(awk '{print $1}' "$MONITOR_OWNER_FILE")" = "$MONITOR_TOKEN" ]
+    run acquire_monitor_lock
+    [ "$status" -eq 2 ]
+    cleanup_monitor_state
+}
+
+@test "wait_for_monitor_ready requires the matching token and pid" {
+    mkdir -p "$STATE_DIR"
+    sleep 5 &
+    child_pid=$!
+    write_monitor_state "$MONITOR_READY_FILE" "wrong ready $child_pid"
+    STARTUP_TIMEOUT=1
+    run wait_for_monitor_ready expected-token "$child_pid"
+    [ "$status" -ne 0 ]
+    kill "$child_pid" 2>/dev/null
+}
+
 # --- vpn_inet dispatch -------------------------------------------------------
 
 @test "vpn_inet dispatches to tun_inet for openvpn and ppp_inet otherwise" {
@@ -186,4 +208,3 @@ teardown() {
     [[ "$fortivpn_path" == *"-fortivpn" ]]
     [[ "$openvpn_path" == *"-openvpn" ]]
 }
-

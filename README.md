@@ -217,7 +217,11 @@ reports whether a TOTP seed is configured. Remove it with
 - **`bin/vpnctl`** — the whole CLI *and* the monitor daemon. `start` daemonizes
   by re-execing itself (`__run__`) under `nohup`; the monitor polls every 10s and
   distinguishes "no process" (reconnect now) from "process up but no tunnel
-  interface" (tolerate a few checks, then force a reconnect).
+  interface" (tolerate a few checks, then force a reconnect). Startup uses an
+  atomic state-directory lock, and `start` waits for a readiness handshake
+  instead of reporting success as soon as a child is forked. The monitor's exit
+  cleanup removes its lock/PID/readiness state and tears down the recorded
+  tunnel; a later start reclaims stale state and stops any orphaned tunnel.
 - **`libexec/fortiVPN.expect`** — (fortivpn backend only) spawns
   `sudo openfortivpn -c <config>` and feeds it the VPN password from the
   environment. Stays attached for the tunnel's life.
@@ -259,6 +263,7 @@ INTERVAL=10                                 # health-check interval (s)
 CONNECT_GRACE=20                            # grace after a (re)connect (s)
 HALF_OPEN_CHECKS=3                          # half-open polls before forcing reconnect
 MAX_LOG_BYTES=1048576                       # log rotation threshold
+STARTUP_TIMEOUT=30                           # seconds to wait for monitor readiness
 SUDOERS_PATH=/etc/sudoers.d/vpncli          # base path; the installed rule is
                                               # suffixed per backend, e.g.
                                               # /etc/sudoers.d/vpncli-fortivpn
