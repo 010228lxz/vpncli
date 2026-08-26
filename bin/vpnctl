@@ -414,17 +414,25 @@ sudo_has_nopasswd() {
     esac
 }
 
-# True only if $1 is alive AND its command line actually looks like our own
-# monitor (`... $PROG __run__`, however it was invoked). This mitigates the
-# classic pid-file race: a stale PID_FILE surviving an unclean exit/crash,
-# later matching an unrelated process that the OS has since reused that same
-# pid for — `kill -0` alone can't distinguish that case from the real monitor.
+# True only if $1 is alive AND its command line contains our exact monitor
+# token. This mitigates the classic pid-file race: a stale PID_FILE surviving
+# an unclean exit/crash, later matching an unrelated process that the OS has
+# since reused that same pid for — `kill -0` alone can't distinguish that case
+# from the real monitor.
 _pid_is_monitor() {
-    local pid="$1" cmd
-    cmd="$(ps -o command= -p "$pid" 2>/dev/null)" || cmd="$(ps -o args= -p "$pid" 2>/dev/null)" || return 1
-    case "$cmd" in
-        *"$PROG"*__run__*) return 0 ;;
-        *)                 return 1 ;;
+    local pid="$1" cmd expected_token
+    expected_token="$MONITOR_TOKEN"
+    if [ -z "$expected_token" ] && [ -f "$MONITOR_OWNER_FILE" ]; then
+        expected_token="$(awk '{print $1}' "$MONITOR_OWNER_FILE" 2>/dev/null)"
+    fi
+    [ -n "$expected_token" ] || return 1
+    cmd="$(ps -ww -o command= -p "$pid" 2>/dev/null)" ||
+        cmd="$(ps -ww -o args= -p "$pid" 2>/dev/null)" || return 1
+    # Match argument boundaries and the token recorded for this monitor start;
+    # a command line merely mentioning "vpnctl __run__" is not sufficient.
+    case " $cmd " in
+        *" $SELF __run__ $expected_token "*) return 0 ;;
+        *)                                             return 1 ;;
     esac
 }
 

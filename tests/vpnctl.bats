@@ -144,12 +144,31 @@ teardown() {
     kill "$unrelated_pid" 2>/dev/null
 }
 
-@test "monitor_pid accepts a live pid whose cmdline matches PROG __run__" {
-    mkdir -p "$STATE_DIR"
+@test "monitor_pid rejects a live process that only mentions PROG __run__" {
+    mkdir -p "$MONITOR_LOCK_DIR"
+    token="monitor-token"
+    printf '%s %s %s\n' "$token" "$$" "$(date +%s)" > "$MONITOR_OWNER_FILE"
+    bash -c 'while :; do sleep 5; done' "$PROG" __run__ "$token" &
+    unrelated_pid=$!
+    sleep 0.3
+    echo "$unrelated_pid" > "$PID_FILE"
+    run monitor_pid
+    [ "$status" -ne 0 ]
+    kill "$unrelated_pid" 2>/dev/null
+}
+
+@test "monitor_pid accepts a live pid whose cmdline matches PROG __run__ and its token" {
+    mkdir -p "$MONITOR_LOCK_DIR"
     fake="$TEST_TMP/$PROG"
     printf '#!/usr/bin/env bash\nsleep 5\n' > "$fake"
     chmod +x "$fake"
-    "$fake" __run__ &
+    # The helper identifies the resolved executable path and unique token.
+    PROG="$(basename "$fake")"
+    SELF="$fake"
+    token="monitor-token"
+    MONITOR_TOKEN="$token"
+    printf '%s %s %s\n' "$token" "$$" "$(date +%s)" > "$MONITOR_OWNER_FILE"
+    "$fake" __run__ "$token" &
     fake_pid=$!
     sleep 0.3
     echo "$fake_pid" > "$PID_FILE"
