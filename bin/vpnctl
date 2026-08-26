@@ -154,11 +154,11 @@ validate_settings() {
 
 print_banner() {
     cat <<EOF
- _ __  __ _ __   __ ___| |  ___
-| '_ \/ _\` |\ \ / /|  __| | / _ \\
-| |_) | (_| | \ V / | |__| ||  __/
-| .__/ \__,_|  \_/  \___|_| \___|
-|_|
+V   V PPPP  N   N  CCCC  L      I
+V   V P   P NN  N C      L      I
+V   V PPPP  N N N C      L      I
+ V V  P     N  NN C      L      I
+  V   P     N   N  CCCC  LLLL   I
 vpnctl — self-supervising VPN tunnel manager
 Version: $VERSION
 EOF
