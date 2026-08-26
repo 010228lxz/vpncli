@@ -99,6 +99,58 @@ log() {
     printf '%s: %s\n' "$(date)" "$*" >> "$LOG_FILE"
 }
 
+validate_settings() {
+    local name value
+    case "${VPN_TYPE:-}" in
+        fortivpn|openvpn) ;;
+        *)
+            echo "Error: VPN_TYPE must be 'fortivpn' or 'openvpn' (got '${VPN_TYPE:-unset}')." >&2
+            return 1
+            ;;
+    esac
+    case "${SECRET_BACKEND:-}" in
+        auto|security|secret-tool|pass) ;;
+        *)
+            echo "Error: SECRET_BACKEND must be auto, security, secret-tool, or pass." >&2
+            return 1
+            ;;
+    esac
+    [ -n "${SECRET_SERVICE:-}" ] || {
+        echo "Error: SECRET_SERVICE must not be empty." >&2
+        return 1
+    }
+    case "$SECRET_SERVICE" in
+        *[[:space:]]*)
+            echo "Error: SECRET_SERVICE must not contain whitespace." >&2
+            return 1
+            ;;
+    esac
+    for name in INTERVAL CONNECT_GRACE HALF_OPEN_CHECKS MAX_LOG_BYTES STARTUP_TIMEOUT; do
+        value="${!name:-}"
+        [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
+            echo "Error: $name must be a positive integer." >&2
+            return 1
+        }
+    done
+    if [ -n "${TUN_IFACE:-}" ] && ! [[ "$TUN_IFACE" =~ ^(tun|utun)[0-9]+$ ]]; then
+        echo "Error: TUN_IFACE must match tunN or utunN." >&2
+        return 1
+    fi
+    for name in CONFIG_DIR STATE_DIR SUDOERS_PATH OPENFORTIVPN OPENVPN VPNCTL_HELPER; do
+        value="${!name:-}"
+        if [ -n "$value" ] && [[ "$value" != /* ]]; then
+            echo "Error: $name must be an absolute path when set." >&2
+            return 1
+        fi
+        case "$value" in
+            *[[:space:]]*)
+                echo "Error: $name must not contain whitespace." >&2
+                return 1
+                ;;
+        esac
+    done
+}
+
 usage() {
     cat <<EOF
 Usage: $PROG <command>
@@ -180,7 +232,14 @@ detect_openvpn() {
 
 resolve_secret_backend() {
     if [ "$SECRET_BACKEND" != "auto" ]; then
-        printf '%s\n' "$SECRET_BACKEND"; return 0
+        case "$SECRET_BACKEND" in
+            security) command -v security >/dev/null 2>&1 ;;
+            secret-tool) command -v secret-tool >/dev/null 2>&1 ;;
+            pass) command -v pass >/dev/null 2>&1 ;;
+            *) return 1 ;;
+        esac || return 1
+        printf '%s\n' "$SECRET_BACKEND"
+        return 0
     fi
     if [ "$OS" = "Darwin" ] && command -v security >/dev/null 2>&1; then
         echo security; return 0
@@ -392,7 +451,8 @@ tun_inet() {
 vpn_inet() {
     case "$VPN_TYPE" in
         openvpn) tun_inet ;;
-        *)       ppp_inet ;;
+        fortivpn) ppp_inet ;;
+        *)       echo "Error: invalid VPN_TYPE '$VPN_TYPE'" >&2; return 1 ;;
     esac
 }
 
@@ -558,7 +618,8 @@ launch_tunnel() {
     fi
     case "$VPN_TYPE" in
         openvpn) launch_openvpn ;;
-        *)       launch_fortivpn ;;
+        fortivpn) launch_fortivpn ;;
+        *)        log "Invalid VPN_TYPE '$VPN_TYPE'; refusing to launch"; return 1 ;;
     esac
 }
 
@@ -1489,6 +1550,10 @@ do_setup() {
     local c imported cand ex ans
     echo "vpnCLI setup"
     echo
+    if ! case "${VPN_TYPE:-}" in fortivpn|openvpn) true ;; *) false ;; esac; then
+        echo "Invalid VPN_TYPE in $SETTINGS_FILE; defaulting to fortivpn for setup."
+        VPN_TYPE="fortivpn"
+    fi
     move_config_to_privileged_dir || return 1
     mkdir -p "$CONFIG_DIR" "$STATE_DIR"
     chmod 700 "$CONFIG_DIR" "$STATE_DIR" 2>/dev/null   # tighten if dirs pre-existed
@@ -1632,12 +1697,19 @@ resolve_active_backend() {
             ACTIVE_STATUS_CMD="$VPNCTL_HELPER status $OPENVPN $OPENVPN_CONFIG_PATH $TUNNEL_PID_FILE"
             ACTIVE_STOP_CMD="$VPNCTL_HELPER stop $TUNNEL_PID_FILE"
             ;;
-        *)
+        fortivpn)
             ACTIVE_BIN="$OPENFORTIVPN"
             ACTIVE_CONFIG="$CONFIG_PATH"
             ACTIVE_LAUNCH_CMD="$VPNCTL_HELPER start-fortivpn $EXPECT_SCRIPT $OPENFORTIVPN $CONFIG_PATH $TUNNEL_PID_FILE"
             ACTIVE_STATUS_CMD="$VPNCTL_HELPER status $OPENFORTIVPN $CONFIG_PATH $TUNNEL_PID_FILE"
             ACTIVE_STOP_CMD="$VPNCTL_HELPER stop $TUNNEL_PID_FILE"
+            ;;
+        *)
+            ACTIVE_BIN=""
+            ACTIVE_CONFIG=""
+            ACTIVE_LAUNCH_CMD=""
+            ACTIVE_STATUS_CMD=""
+            ACTIVE_STOP_CMD=""
             ;;
     esac
     # Suffixed per backend (vpncli-fortivpn / vpncli-openvpn) so both backends'
@@ -1648,6 +1720,9 @@ resolve_active_backend() {
 resolve_active_backend
 
 if [ "$VPNCTL_SOURCED" -eq 0 ]; then
+    if [ "${1:-}" != "setup" ] && ! validate_settings; then
+        exit 1
+    fi
     case "${1:-}" in
         start)             do_start ;;
         stop)              do_stop ;;

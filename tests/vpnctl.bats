@@ -8,9 +8,8 @@
 # of executed. VPNCLI_CONFIG_DIR/VPNCLI_STATE_DIR are always pointed at a
 # throwaway temp dir so tests never touch a real ~/.config or ~/.local/state.
 #
-# Anything that shells out to the OS secret store (security/secret-tool/pass),
-# a real VPN binary, or /etc/sudoers.d is intentionally NOT exercised here —
-# those need mocked-shell / integration-style coverage, not unit tests.
+# Anything that shells out to the OS secret store, a real VPN binary, or
+# /etc/sudoers.d is covered with disposable fakes in integration.bats instead.
 
 setup() {
     VPNCTL="${BATS_TEST_DIRNAME}/../bin/vpnctl"
@@ -212,6 +211,39 @@ teardown() {
     VPN_TYPE=fortivpn
     run vpn_inet
     [ "$output" = "ppp-called" ]
+}
+
+# --- settings validation -----------------------------------------------------
+
+@test "validate_settings rejects an unknown backend instead of treating it as fortivpn" {
+    VPN_TYPE=wireguard
+    run validate_settings
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"VPN_TYPE"* ]]
+}
+
+@test "validate_settings rejects invalid secret backend and timing values" {
+    SECRET_BACKEND=keychain
+    run validate_settings
+    [ "$status" -ne 0 ]
+
+    SECRET_BACKEND=auto
+    INTERVAL=0
+    run validate_settings
+    [ "$status" -ne 0 ]
+}
+
+@test "validate_settings accepts supported backend and settings values" {
+    VPN_TYPE=openvpn
+    SECRET_BACKEND=auto
+    INTERVAL=10
+    CONNECT_GRACE=20
+    HALF_OPEN_CHECKS=3
+    MAX_LOG_BYTES=1048576
+    STARTUP_TIMEOUT=30
+    TUN_IFACE=utun4
+    run validate_settings
+    [ "$status" -eq 0 ]
 }
 
 # --- resolve_active_backend --------------------------------------------------

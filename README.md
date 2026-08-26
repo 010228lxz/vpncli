@@ -269,6 +269,13 @@ SUDOERS_PATH=/etc/sudoers.d/vpncli          # base path; the installed rule is
                                               # /etc/sudoers.d/vpncli-fortivpn
 ```
 
+Settings are validated before any command runs. `VPN_TYPE` and
+`SECRET_BACKEND` must use the values shown above; timing values must be positive
+integers; configured executable, directory, and sudoers paths must be absolute
+and contain no whitespace; and a pinned `TUN_IFACE` must be named `tunN` or
+`utunN`. Invalid settings fail with an actionable error instead of silently
+selecting a different backend.
+
 After changing `OPENFORTIVPN`/`OPENVPN`, or the config location, re-run
 `vpnctl install-sudoers` so the passwordless rule matches the new command
 (switching `VPN_TYPE` itself doesn't require this — see "Switching backends").

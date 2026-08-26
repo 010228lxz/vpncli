@@ -39,7 +39,7 @@ jobs:
         run: bash -n bin/vpnctl
 
       - name: Run bats test suite
-        run: bats tests/vpnctl.bats
+        run: bats tests/vpnctl.bats tests/integration.bats
 
   formula-audit:
     name: Homebrew formula audit
