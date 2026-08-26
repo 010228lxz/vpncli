@@ -656,7 +656,8 @@ teardown_tunnel() {
         kill "$TUNNEL_PID" 2>/dev/null
     fi
     TUNNEL_PID=""
-    sudo -n "$VPNCTL_HELPER" stop "$TUNNEL_PID_FILE" 2>/dev/null || true
+    sudo -n "$VPNCTL_HELPER" stop "$ACTIVE_BIN" "$ACTIVE_CONFIG" \
+        "$TUNNEL_PID_FILE" 2>/dev/null || true
 }
 
 write_monitor_state() {
@@ -1695,14 +1696,14 @@ resolve_active_backend() {
             ACTIVE_CONFIG="$OPENVPN_CONFIG_PATH"
             ACTIVE_LAUNCH_CMD="$VPNCTL_HELPER start-openvpn $OPENVPN $OPENVPN_CONFIG_PATH $OPENVPN_AUTH_FILE $TUNNEL_PID_FILE"
             ACTIVE_STATUS_CMD="$VPNCTL_HELPER status $OPENVPN $OPENVPN_CONFIG_PATH $TUNNEL_PID_FILE"
-            ACTIVE_STOP_CMD="$VPNCTL_HELPER stop $TUNNEL_PID_FILE"
+            ACTIVE_STOP_CMD="$VPNCTL_HELPER stop $OPENVPN $OPENVPN_CONFIG_PATH $TUNNEL_PID_FILE"
             ;;
         fortivpn)
             ACTIVE_BIN="$OPENFORTIVPN"
             ACTIVE_CONFIG="$CONFIG_PATH"
             ACTIVE_LAUNCH_CMD="$VPNCTL_HELPER start-fortivpn $EXPECT_SCRIPT $OPENFORTIVPN $CONFIG_PATH $TUNNEL_PID_FILE"
             ACTIVE_STATUS_CMD="$VPNCTL_HELPER status $OPENFORTIVPN $CONFIG_PATH $TUNNEL_PID_FILE"
-            ACTIVE_STOP_CMD="$VPNCTL_HELPER stop $TUNNEL_PID_FILE"
+            ACTIVE_STOP_CMD="$VPNCTL_HELPER stop $OPENFORTIVPN $CONFIG_PATH $TUNNEL_PID_FILE"
             ;;
         *)
             ACTIVE_BIN=""

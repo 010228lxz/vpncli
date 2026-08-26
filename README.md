@@ -309,8 +309,10 @@ The design keeps secrets out of the process list (`ps`) and out of sudo prompts:
   directives that can launch external scripts or plugins.
 - The privileged launch/status/stop operations run through the installed,
   root-owned `vpnctl-helper`. It records the tunnel PID in `/var/run`, verifies
-  that the PID command matches the expected VPN binary and config, and stops
-  only that recorded PID rather than using a broad `pkill` pattern.
+  that the PID command matches the expected VPN binary and config for both
+  status and stop, and stops only that recorded PID rather than using a broad
+  `pkill` pattern. Re-run `vpnctl install-sudoers` after upgrading so the
+  generated stop rule includes those identity arguments.
 - Files the tool writes (config, logs, pid, the openvpn auth file) are created
   owner-only (`umask 077`; `setup` also tightens the config and state dirs to
   `700`).

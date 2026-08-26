@@ -11,7 +11,7 @@
 # rendered from the same paths the tool actually runs, so:
 #   - the helper starts and supervises the VPN process,
 #   - status verifies the PID belongs to the expected VPN command, and
-#   - stop terminates only the PID recorded by the root-owned helper.
+#   - stop verifies the expected VPN command before terminating its recorded PID.
 # Because it is generated per machine, moving the repo can never desync it again.
 #
 # Re-run `vpnctl install-sudoers` after changing the openfortivpn path or the
@@ -19,4 +19,4 @@
 
 __USER__ ALL=(root) NOPASSWD: __HELPER__ start-fortivpn __EXPECT__ __OPENFORTIVPN__ __CONFIG__ __PID_FILE__
 __USER__ ALL=(root) NOPASSWD: __HELPER__ status __OPENFORTIVPN__ __CONFIG__ __PID_FILE__
-__USER__ ALL=(root) NOPASSWD: __HELPER__ stop __PID_FILE__
+__USER__ ALL=(root) NOPASSWD: __HELPER__ stop __OPENFORTIVPN__ __CONFIG__ __PID_FILE__

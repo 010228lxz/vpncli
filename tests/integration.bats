@@ -19,7 +19,7 @@ setup() {
 
 teardown() {
     if [ -n "${VPN_PID:-}" ] && kill -0 "$VPN_PID" 2>/dev/null; then
-        "$HELPER" stop "$VPN_PID_FILE" >/dev/null 2>&1 || true
+        "$HELPER" stop "${VPN_BINARY:-}" "${VPN_CONFIG:-}" "$VPN_PID_FILE" >/dev/null 2>&1 || true
         kill "$VPN_PID" 2>/dev/null || true
     fi
     rm -rf "$TEST_TMP"
@@ -59,6 +59,8 @@ EOF
     config="$TEST_TMP/client.ovpn"
     auth="$TEST_TMP/auth"
     VPN_PID_FILE="$TEST_TMP/vpn.pid"
+    VPN_BINARY="$fake_vpn"
+    VPN_CONFIG="$config"
     printf '# fake config\n' > "$config"
     printf 'user\npassword\n' > "$auth"
     cat > "$fake_vpn" <<'EOF'
@@ -76,7 +78,7 @@ EOF
     [ -s "$VPN_PID_FILE" ]
     VPN_PID="$(cat "$VPN_PID_FILE")"
     "$HELPER" status "$fake_vpn" "$config" "$VPN_PID_FILE"
-    "$HELPER" stop "$VPN_PID_FILE"
+    "$HELPER" stop "$fake_vpn" "$config" "$VPN_PID_FILE"
     wait "$helper_pid" 2>/dev/null || true
     ! kill -0 "$VPN_PID" 2>/dev/null
     [ ! -e "$VPN_PID_FILE" ]
@@ -87,6 +89,23 @@ EOF
     printf 'not-a-pid\n' > "$pid_file"
     run "$HELPER" stop "$pid_file"
     [ "$status" -ne 0 ]
+    [ -e "$pid_file" ]
+}
+
+@test "helper refuses to stop a process with a mismatched identity" {
+    config="$TEST_TMP/client.ovpn"
+    pid_file="$TEST_TMP/vpn.pid"
+    VPN_PID_FILE="$pid_file"
+    VPN_BINARY="$TEST_TMP/not-the-vpn"
+    VPN_CONFIG="$config"
+    printf '# fake config\n' > "$config"
+    sleep 30 &
+    VPN_PID="$!"
+    printf '%s\n' "$VPN_PID" > "$pid_file"
+
+    run "$HELPER" stop "$TEST_TMP/not-the-vpn" "$config" "$pid_file"
+    [ "$status" -ne 0 ]
+    kill -0 "$VPN_PID"
     [ -e "$pid_file" ]
 }
 
