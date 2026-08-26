@@ -1646,11 +1646,19 @@ do_setup() {
             echo "Config already present: $OPENVPN_CONFIG_PATH"
             if [ -z "$OPENVPN_USERNAME" ]; then prompt_openvpn_config; fi
         else
-            ex="$(find_asset vpn.ovpn.example)" && cp "$ex" "$OPENVPN_CONFIG_PATH"
+            ex="$(find_asset vpn.ovpn.example)" || {
+                echo "Error: vpn.ovpn.example template not found." >&2
+                return 1
+            }
+            sudo install -o root -m 644 "$ex" "$OPENVPN_CONFIG_PATH" || return 1
             echo "Created config from template: $OPENVPN_CONFIG_PATH"
             prompt_openvpn_config
         fi
-        chmod 600 "$OPENVPN_CONFIG_PATH" 2>/dev/null
+        if [ "$CONFIG_DIR" = "/etc/vpncli" ]; then
+            sudo chmod 644 "$OPENVPN_CONFIG_PATH" || return 1
+        else
+            chmod 600 "$OPENVPN_CONFIG_PATH" 2>/dev/null
+        fi
     else
         if [ -r "$CONFIG_PATH" ]; then
             echo "Config already present: $CONFIG_PATH"
@@ -1669,18 +1677,28 @@ do_setup() {
                 read -r ans
                 case "$ans" in
                     [Nn]*) ;;
-                    *)     cp "$cand" "$CONFIG_PATH" && imported="$cand" ;;
+                    *)     sudo install -o root -m 644 "$cand" "$CONFIG_PATH" ||
+                               return 1
+                           imported="$cand" ;;
                 esac
             fi
             if [ -n "$imported" ]; then
                 echo "Imported existing config: $imported → $CONFIG_PATH"
             else
-                ex="$(find_asset vpn.conf.example)" && cp "$ex" "$CONFIG_PATH"
+                ex="$(find_asset vpn.conf.example)" || {
+                    echo "Error: vpn.conf.example template not found." >&2
+                    return 1
+                }
+                sudo install -o root -m 644 "$ex" "$CONFIG_PATH" || return 1
                 echo "Created config from template: $CONFIG_PATH"
                 prompt_config
             fi
         fi
-        chmod 600 "$CONFIG_PATH" 2>/dev/null
+        if [ "$CONFIG_DIR" = "/etc/vpncli" ]; then
+            sudo chmod 644 "$CONFIG_PATH" || return 1
+        else
+            chmod 600 "$CONFIG_PATH" 2>/dev/null
+        fi
     fi
     echo
 
