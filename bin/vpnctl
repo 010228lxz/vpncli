@@ -59,7 +59,7 @@ MONITOR_READY_FILE="$STATE_DIR/monitor.ready"
 # ---------------------------------------------------------------------------
 # Defaults (override any of these in $SETTINGS_FILE).
 # ---------------------------------------------------------------------------
-VERSION="0.1.15"
+VERSION="0.1.16"
 VPN_TYPE="fortivpn"                   # fortivpn | openvpn — which backend to drive
 OPENFORTIVPN=""                       # empty → auto-detect
 OPENVPN=""                            # empty → auto-detect (openvpn backend)
@@ -725,7 +725,10 @@ acquire_monitor_lock() {
     fi
     if monitor_lock_is_stale; then
         log "Recovering stale monitor state"
-        sudo -n "$VPNCTL_HELPER" stop "$TUNNEL_PID_FILE" 2>/dev/null || true
+        # Use the backend-specific command so the helper can verify the VPN
+        # process identity before terminating an orphaned tunnel.
+        # shellcheck disable=SC2086  # validated command assembled per backend
+        sudo -n $ACTIVE_STOP_CMD 2>/dev/null || true
         rm -f "$PID_FILE" "$MONITOR_READY_FILE"
         rm -f "$MONITOR_OWNER_FILE"
         rmdir "$MONITOR_LOCK_DIR" 2>/dev/null || return 1
@@ -1810,7 +1813,7 @@ if [ "$VPNCTL_SOURCED" -eq 0 ]; then
         unset-otp-secret)  do_unset_otp_secret ;;
         install-sudoers)   do_install_sudoers ;;
         uninstall-sudoers) do_uninstall_sudoers "${2:-}" ;;
-        __run__)           run_monitor ;;
+        __run__)           run_monitor "${2:-}" ;;
         -h|--help|help)    usage ;;
         *)                 usage ;;
     esac
