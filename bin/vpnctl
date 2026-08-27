@@ -760,7 +760,7 @@ wait_for_monitor_ready() {
 # Monitor daemon
 # ===========================================================================
 run_monitor() {
-    MONITOR_TOKEN="${2:-}"
+    MONITOR_TOKEN="${1:-}"
     if [ -z "$MONITOR_TOKEN" ] || ! monitor_lock_owned; then
         log "Exiting: monitor startup lock is not owned"
         return 1

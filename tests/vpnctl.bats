@@ -231,6 +231,23 @@ teardown() {
     kill "$child_pid" 2>/dev/null
 }
 
+@test "real __run__ dispatch passes the monitor token to run_monitor" {
+    mkdir -p "$CONFIG_DIR" "$MONITOR_LOCK_DIR"
+    printf '#!/bin/sh\nexit 1\n' > "$TEST_TMP/secret-tool"
+    chmod +x "$TEST_TMP/secret-tool"
+    PATH="$TEST_TMP:$PATH"
+    export PATH
+    printf 'VPN_TYPE=fortivpn\nOPENFORTIVPN=/definitely/missing/openfortivpn\nSECRET_BACKEND=secret-tool\n' \
+        > "$SETTINGS_FILE"
+    token="dispatch-token"
+    printf '%s %s %s\n' "$token" "$$" "$(date +%s)" > "$MONITOR_OWNER_FILE"
+
+    run "$VPNCTL" __run__ "$token"
+    [ "$status" -ne 0 ]
+    [[ "$output" != *"monitor startup lock is not owned"* ]]
+    [[ "$(cat "$LOG_FILE")" == *"no VPN password in the secret store"* ]]
+}
+
 # --- vpn_inet dispatch -------------------------------------------------------
 
 @test "vpn_inet dispatches to tun_inet for openvpn and ppp_inet otherwise" {
