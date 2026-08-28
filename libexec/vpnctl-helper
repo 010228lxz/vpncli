@@ -26,9 +26,12 @@ process_matches() {
     vpn_binary=$2
     config=$3
     command_line=$(ps -ww -o command= -p "$pid" 2>/dev/null || true)
-    case "$command_line" in
-        *"$vpn_binary"*"$config"*) return 0 ;;
-        *)                         return 1 ;;
+    # ps exposes a rendered command line rather than argv. Pad it with spaces
+    # so paths are matched as complete whitespace-delimited arguments, not as
+    # prefixes/suffixes of unrelated executable or config names.
+    case " $command_line " in
+        *" $vpn_binary "*"$config "*) return 0 ;;
+        *)                             return 1 ;;
     esac
 }
 

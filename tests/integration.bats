@@ -113,6 +113,22 @@ EOF
     [ -e "$pid_file" ]
 }
 
+@test "helper rejects executable and config path prefixes in a process identity" {
+    config="$TEST_TMP/client.ovpn"
+    pid_file="$TEST_TMP/vpn.pid"
+    fake_vpn="$TEST_TMP/fake-openvpn"
+    printf '# fake config\n' > "$config"
+    bash -c 'sleep 30' "$fake_vpn-extra" "$config-extra" &
+    VPN_PID="$!"
+    printf '%s\n' "$VPN_PID" > "$pid_file"
+
+    run "$HELPER" stop "$fake_vpn" "$config" "$pid_file"
+    [ "$status" -ne 0 ]
+    kill -0 "$VPN_PID"
+    [ -e "$pid_file" ]
+    kill "$VPN_PID"
+}
+
 @test "privileged helper stop refuses a stale PID reused by another process" {
     command -v sudo >/dev/null 2>&1 || skip "sudo not available"
     run sudo -n true

@@ -59,7 +59,7 @@ MONITOR_READY_FILE="$STATE_DIR/monitor.ready"
 # ---------------------------------------------------------------------------
 # Defaults (override any of these in $SETTINGS_FILE).
 # ---------------------------------------------------------------------------
-VERSION="0.1.16"
+VERSION="0.1.17"
 VPN_TYPE="fortivpn"                   # fortivpn | openvpn — which backend to drive
 OPENFORTIVPN=""                       # empty → auto-detect
 OPENVPN=""                            # empty → auto-detect (openvpn backend)
@@ -1294,8 +1294,26 @@ conf_set() {
 # Set/replace a shell-style "KEY=value" assignment in $SETTINGS_FILE (append if
 # absent). Used to persist non-secret, per-machine tunables like VPN_TYPE and
 # OPENVPN_USERNAME outside of code, same as every other setting.
+config_dir_is_privileged() {
+    local current="$CONFIG_DIR" owner mode
+    [ -d "$current" ] || return 1
+    while [ "$current" != "/" ] && [ -n "$current" ]; do
+        owner="$(_path_owner "$current")"
+        mode="$(_path_mode "$current")"
+        if [ "$owner" != "root" ] || [ -z "$mode" ] || (( (8#$mode) & 18 )); then
+            return 1
+        fi
+        current="$(dirname "$current")"
+    done
+}
+
+settings_mode() {
+    config_dir_is_privileged && printf '644' || printf '600'
+}
+
 settings_set() {
-    local key="$1" val="$2" tmp line found=0
+    local key="$1" val="$2" tmp line found=0 mode
+    mode="$(settings_mode)"
     mkdir -p "$CONFIG_DIR" 2>/dev/null
     tmp="$(mktemp "${TMPDIR:-/tmp}/vpncli.settings.XXXXXX")" || return 1
     if [ -f "$SETTINGS_FILE" ]; then
@@ -1313,9 +1331,9 @@ settings_set() {
     fi
     if [ -w "$CONFIG_DIR" ] && { [ ! -e "$SETTINGS_FILE" ] || [ -w "$SETTINGS_FILE" ]; }; then
         mv "$tmp" "$SETTINGS_FILE"
-        chmod 600 "$SETTINGS_FILE" 2>/dev/null
+        chmod "$mode" "$SETTINGS_FILE" 2>/dev/null
     else
-        sudo install -o root -m 600 "$tmp" "$SETTINGS_FILE"
+        sudo install -o root -m "$mode" "$tmp" "$SETTINGS_FILE"
         rm -f "$tmp"
     fi
 }
@@ -1605,6 +1623,9 @@ do_setup() {
         echo "Invalid VPN_TYPE in $SETTINGS_FILE; defaulting to fortivpn for setup."
         VPN_TYPE="fortivpn"
     fi
+    # Setup may repair the two interactive bootstrap values above, but all
+    # remaining settings must be valid before it changes files or sudo policy.
+    validate_settings || return 1
     move_config_to_privileged_dir || return 1
     mkdir -p "$CONFIG_DIR" "$STATE_DIR"
     chmod 700 "$CONFIG_DIR" "$STATE_DIR" 2>/dev/null   # tighten if dirs pre-existed
@@ -1657,7 +1678,7 @@ do_setup() {
             echo "Created config from template: $OPENVPN_CONFIG_PATH"
             prompt_openvpn_config
         fi
-        if [ "$CONFIG_DIR" = "/etc/vpncli" ]; then
+        if config_dir_is_privileged; then
             sudo chmod 644 "$OPENVPN_CONFIG_PATH" || return 1
         else
             chmod 600 "$OPENVPN_CONFIG_PATH" 2>/dev/null
@@ -1697,7 +1718,7 @@ do_setup() {
                 prompt_config
             fi
         fi
-        if [ "$CONFIG_DIR" = "/etc/vpncli" ]; then
+        if config_dir_is_privileged; then
             sudo chmod 644 "$CONFIG_PATH" || return 1
         else
             chmod 600 "$CONFIG_PATH" 2>/dev/null

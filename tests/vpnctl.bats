@@ -35,7 +35,7 @@ teardown() {
     [ "$status" -eq 1 ]
     [[ "$output" == *"V   V PPPP  N   N  CCCC  L      I"* ]]
     [[ "$output" == *"vpnctl — self-supervising VPN tunnel manager"* ]]
-    [[ "$output" == *"Version: 0.1.16"* ]]
+    [[ "$output" == *"Version: 0.1.17"* ]]
     [[ "$output" == *"Usage: vpnctl <command>"* ]]
 }
 
@@ -43,7 +43,7 @@ teardown() {
     VPN_TYPE=invalid
     run "$VPNCTL" --version
     [ "$status" -eq 0 ]
-    [ "$output" = "vpnctl 0.1.16" ]
+    [ "$output" = "vpnctl 0.1.17" ]
 }
 
 # --- secret_account / secret_account_legacy (per-backend scoping) ----------
@@ -100,6 +100,16 @@ teardown() {
     settings_set VPN_TYPE openvpn
     run cat "$SETTINGS_FILE"
     [[ "$output" == *"VPN_TYPE=openvpn"* ]]
+}
+
+@test "settings_set keeps protected settings readable by the invoking user" {
+    _path_owner() { printf 'root'; }
+    _path_mode() { printf '755'; }
+    CONFIG_DIR="$TEST_TMP/privileged"
+    mkdir -p "$CONFIG_DIR"
+    [ "$(settings_mode)" = "644" ]
+    CONFIG_DIR="$TEST_TMP/config"
+    [ "$(settings_mode)" = "600" ]
 }
 
 # --- sudoers_escape / render_template (replaces the old sed renderer) ------
@@ -302,6 +312,14 @@ teardown() {
     OS=Linux
     printf '\n' | repair_secret_backend
     [[ "$(cat "$SETTINGS_FILE")" == *"SECRET_BACKEND=auto"* ]]
+}
+
+@test "setup rejects invalid settings before making changes" {
+    repair_secret_backend() { :; }
+    INTERVAL=0
+    run do_setup
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"INTERVAL must be a positive integer"* ]]
 }
 
 # --- resolve_active_backend --------------------------------------------------
