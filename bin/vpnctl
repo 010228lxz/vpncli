@@ -59,7 +59,7 @@ MONITOR_READY_FILE="$STATE_DIR/monitor.ready"
 # ---------------------------------------------------------------------------
 # Defaults (override any of these in $SETTINGS_FILE).
 # ---------------------------------------------------------------------------
-VERSION="0.1.17"
+VERSION="0.1.18"
 VPN_TYPE="fortivpn"                   # fortivpn | openvpn — which backend to drive
 OPENFORTIVPN=""                       # empty → auto-detect
 OPENVPN=""                            # empty → auto-detect (openvpn backend)
@@ -154,11 +154,12 @@ validate_settings() {
 
 print_banner() {
     cat <<EOF
-V   V PPPP  N   N  CCCC  L      I
-V   V P   P NN  N C      L      I
-V   V PPPP  N N N C      L      I
- V V  P     N  NN C      L      I
-  V   P     N   N  CCCC  LLLL   I
+
+__   __ ____  _   _  ____ _     ___
+\ \ / /|  _ \| \ | |/ ___| |   |_ _|
+ \ V / | |_) |  \| | |   | |    | |
+  | |  |  __/| |\  | |___| |___ | |
+  |_|  |_|   |_| \_|\____|_____|___|
 vpnctl — self-supervising VPN tunnel manager
 Version: $VERSION
 EOF
@@ -170,39 +171,39 @@ $(print_banner)
 
 Usage: $PROG <command>
 
-  start              Start the background monitor (auto-reconnecting tunnel)
-  stop               Stop the monitor; its trap tears the tunnel down
-  restart
-  switch <backend>   Switch to fortivpn|openvpn (persists to settings); if the
-                     target backend is already fully configured (config,
-                     password, sudoers — each independent per backend) this
-                     needs no re-entry and restarts the monitor if it was
-                     running. Otherwise it lists exactly what's still missing
-  status             Monitor + tunnel state
-  routes             VPN routes, and whether it's a FULL or SPLIT tunnel
-  logs [-f]          Show (or follow) the log
-  doctor             Diagnostics — run this first when anything is wrong
-  setup              First-run setup: config + password + sudoers
-  set-password       Store the VPN password in the OS secret store (scoped to
-                     the active backend — fortivpn and openvpn each keep
-                     their own password, so switching never mixes them up)
-  set-otp-secret     Store a TOTP seed; a fresh 6-digit code is appended to
-                     the password on every connect (for password+OTP
-                     gateways). Also scoped to the active backend only — e.g.
-                     you can require OTP on openvpn while fortivpn stays
-                     password-only, with no cross-contamination either way
-  unset-otp-secret   Remove the stored TOTP seed (active backend only)
-  install-sudoers    (Re)install the passwordless-sudo rule for the active
-                     backend (fortivpn and openvpn each get their own rule
-                     file, so installing one never removes the other's)
-  uninstall-sudoers [--all]
-                     Remove the active backend's passwordless-sudo rule
-                     (--all removes both backends' rules)
-  version             Show the current version
+Quick start:
+  setup              Configure a backend, password, and sudoers rule
+  start              Start the auto-reconnecting background monitor
+  stop               Stop the monitor and tear down the tunnel
+  restart            Restart the monitor
 
-Config:  $CONFIG_PATH  (openvpn: $OPENVPN_CONFIG_PATH)
-State:   $STATE_DIR
-Backend: $VPN_TYPE   (set VPN_TYPE=fortivpn|openvpn in $SETTINGS_FILE, or: $PROG switch <backend>)
+Monitor:
+  status             Show monitor and tunnel state
+  routes             Show VPN routes and FULL/SPLIT mode
+  logs [-f]          Show or follow the log
+  doctor             Run diagnostics
+
+Configuration:
+  switch <backend>   Select fortivpn or openvpn
+  set-password       Store the VPN password for the active backend
+  set-otp-secret     Store a TOTP seed for the active backend
+  unset-otp-secret   Remove the active backend's TOTP seed
+
+Permissions:
+  install-sudoers    Install the active backend's passwordless-sudo rule
+  uninstall-sudoers [--all]
+                     Remove one rule, or both with --all
+
+Other:
+  version             Show the current version
+  help               Show this help
+
+Active backend:  $VPN_TYPE
+Config files:
+  fortivpn:      $CONFIG_PATH
+  openvpn:       $OPENVPN_CONFIG_PATH
+State:           $STATE_DIR
+Backend setting: $SETTINGS_FILE
 EOF
     exit 1
 }

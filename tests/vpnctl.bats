@@ -33,9 +33,9 @@ teardown() {
 @test "usage includes the title logo and version" {
     run "$VPNCTL"
     [ "$status" -eq 1 ]
-    [[ "$output" == *"V   V PPPP  N   N  CCCC  L      I"* ]]
+    [[ "$output" == *"__   __ ____  _   _  ____ _     ___"* ]]
     [[ "$output" == *"vpnctl — self-supervising VPN tunnel manager"* ]]
-    [[ "$output" == *"Version: 0.1.17"* ]]
+    [[ "$output" == *"Version: 0.1.18"* ]]
     [[ "$output" == *"Usage: vpnctl <command>"* ]]
 }
 
@@ -43,7 +43,7 @@ teardown() {
     VPN_TYPE=invalid
     run "$VPNCTL" --version
     [ "$status" -eq 0 ]
-    [ "$output" = "vpnctl 0.1.17" ]
+    [ "$output" = "vpnctl 0.1.18" ]
 }
 
 # --- secret_account / secret_account_legacy (per-backend scoping) ----------
