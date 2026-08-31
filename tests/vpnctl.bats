@@ -35,7 +35,7 @@ teardown() {
     [ "$status" -eq 1 ]
     [[ "$output" == *"__   __ ____  _   _  ____ _     ___"* ]]
     [[ "$output" == *"vpnctl — self-supervising VPN tunnel manager"* ]]
-    [[ "$output" == *"Version: 0.1.18"* ]]
+    [[ "$output" == *"Version: 0.1.19"* ]]
     [[ "$output" == *"Usage: vpnctl <command>"* ]]
 }
 
@@ -43,7 +43,7 @@ teardown() {
     VPN_TYPE=invalid
     run "$VPNCTL" --version
     [ "$status" -eq 0 ]
-    [ "$output" = "vpnctl 0.1.18" ]
+    [ "$output" = "vpnctl 0.1.19" ]
 }
 
 # --- secret_account / secret_account_legacy (per-backend scoping) ----------
@@ -270,6 +270,14 @@ teardown() {
     VPN_TYPE=fortivpn
     run vpn_inet
     [ "$output" = "ppp-called" ]
+}
+
+@test "openvpn interface detection follows the latest OpenVPN interface log entry" {
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' \
+        '2026-08-31 09:00:00 Opened utun device utun4' \
+        '2026-08-31 09:01:00 Opened utun device utun13' > "$LOG_FILE"
+    [ "$(openvpn_log_iface)" = "utun13" ]
 }
 
 # --- settings validation -----------------------------------------------------

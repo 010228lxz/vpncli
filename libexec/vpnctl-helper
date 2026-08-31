@@ -21,6 +21,13 @@ read_pid() {
     printf '%s\n' "$pid"
 }
 
+remove_pid_if_owned() {
+    pid_file=$1
+    pid=$2
+    current_pid=$(cat "$pid_file" 2>/dev/null || true)
+    [ "$current_pid" = "$pid" ] && rm -f "$pid_file"
+}
+
 process_matches() {
     pid=$1
     vpn_binary=$2
@@ -52,7 +59,7 @@ case "$command_name" in
         umask 077
         printf '%s\n' "$pid" > "$pid_file"
         wait "$pid"
-        rm -f "$pid_file"
+        remove_pid_if_owned "$pid_file" "$pid"
         ;;
     start-openvpn)
         [ "$#" -eq 4 ] || die "invalid start-openvpn arguments"
@@ -66,7 +73,7 @@ case "$command_name" in
         umask 077
         printf '%s\n' "$pid" > "$pid_file"
         wait "$pid"
-        rm -f "$pid_file"
+        remove_pid_if_owned "$pid_file" "$pid"
         ;;
     status)
         [ "$#" -eq 3 ] || die "invalid status arguments"

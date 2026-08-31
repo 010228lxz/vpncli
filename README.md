@@ -15,7 +15,7 @@ repo; per-machine config and credentials are created by `vpnctl setup`.
 
 ```sh
 brew tap 010228lxz/vpncli https://github.com/010228lxz/vpncli
-brew install 010228lxz/vpncli/vpncli   # stable v0.1.18 (add --HEAD to track main instead)
+brew install 010228lxz/vpncli/vpncli   # stable v0.1.19 (add --HEAD to track main instead)
 vpnctl setup                           # finish per-machine setup (requires sudo)
 ```
 
@@ -135,11 +135,10 @@ readable by the root-launched client.
 
 **macOS + openvpn caveat:** unlike `ppp0`/`tun0`, openvpn's `utun` interface name
 on macOS is assigned dynamically and isn't unique to this tool (other VPNs/OS
-features use `utun*` too), so tunnel-health detection is best-effort: it picks
-the first `utun*` with an address. If that's ambiguous on your machine, pin the
-exact interface with `TUN_IFACE=utun4` in `settings` once you know which one
-openvpn is actually using (check `vpnctl logs` or `ifconfig` after connecting).
-`vpnctl doctor` and `vpnctl setup` both warn about this until `TUN_IFACE` is set.
+features use `utun*` too). When `TUN_IFACE` is empty, `vpnctl` therefore uses
+the most recent `Opened utun device ...` entry emitted by OpenVPN rather than
+assuming the first addressed `utun*` belongs to this tunnel. Pin
+`TUN_IFACE=utunN` only when required by a provider or troubleshooting.
 
 ## Switching backends
 

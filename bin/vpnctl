@@ -59,7 +59,7 @@ MONITOR_READY_FILE="$STATE_DIR/monitor.ready"
 # ---------------------------------------------------------------------------
 # Defaults (override any of these in $SETTINGS_FILE).
 # ---------------------------------------------------------------------------
-VERSION="0.1.18"
+VERSION="0.1.19"
 VPN_TYPE="fortivpn"                   # fortivpn | openvpn — which backend to drive
 OPENFORTIVPN=""                       # empty → auto-detect
 OPENVPN=""                            # empty → auto-detect (openvpn backend)
@@ -431,12 +431,17 @@ net_default_iface() {
     route -n get 8.8.8.8 2>/dev/null | awk '/interface:/{print $2; exit}'
 }
 
-# Echoes "<iface> <ip>" for the openvpn tunnel interface. On Linux this is
-# unambiguous (tun[0-9]*). On macOS, openvpn's own utun driver assigns a name
-# dynamically, and utun* is also used by other things (other VPNs, Continuity,
-# etc.), so this is best-effort unless TUN_IFACE pins an exact name.
+# Echoes the interface OpenVPN reported when it created the tunnel. On Linux
+# tun[0-9]* is unambiguous. On macOS, utun* is shared by other VPNs and
+# services, so selecting the first addressed utun can produce false positives.
+openvpn_log_iface() {
+    [ -f "$LOG_FILE" ] || return 1
+    awk '/Opened utun device utun[0-9]+$/{iface=$NF} END{if (iface != "") print iface}' \
+        "$LOG_FILE"
+}
+
 tun_inet() {
-    local out i ip
+    local out i ip iface
     if [ -n "$TUN_IFACE" ]; then
         if [ "$OS" = "Linux" ] && command -v ip >/dev/null 2>&1; then
             ip="$(ip -o -4 addr show dev "$TUN_IFACE" 2>/dev/null \
@@ -445,6 +450,16 @@ tun_inet() {
             ip="$(ifconfig "$TUN_IFACE" 2>/dev/null | awk '/inet /{print $2; exit}')"
         fi
         [ -n "$ip" ] && { printf '%s %s\n' "$TUN_IFACE" "$ip"; return 0; }
+        return 1
+    fi
+    if [ "$OS" = "Darwin" ]; then
+        iface="$(openvpn_log_iface)"
+        case "$iface" in
+            utun[0-9]*)
+                ip="$(ifconfig "$iface" 2>/dev/null | awk '/inet /{print $2; exit}')"
+                [ -n "$ip" ] && { printf '%s %s\n' "$iface" "$ip"; return 0; }
+                ;;
+        esac
         return 1
     fi
     if [ "$OS" = "Linux" ] && command -v ip >/dev/null 2>&1; then
@@ -1080,7 +1095,7 @@ do_doctor() {
             if [ -n "$TUN_IFACE" ]; then
                 report ok "TUN_IFACE pinned ($TUN_IFACE) — unambiguous tunnel-health detection"
             else
-                report warn "TUN_IFACE not set on macOS — health checks fall back to the first addressed utun*, which other VPNs/services can also use and may be misreported as this tunnel; set TUN_IFACE=utunN in $SETTINGS_FILE once you know which interface openvpn uses (see 'vpnctl logs' after connecting)"
+                report info "TUN_IFACE not set on macOS — health checks use the interface reported by OpenVPN in $LOG_FILE"
             fi
         fi
     else
@@ -1405,11 +1420,8 @@ prompt_openvpn_config() {
     if [ "$OS" = "Darwin" ] && [ -z "$TUN_IFACE" ]; then
         echo
         echo "Note: on macOS, openvpn's utun interface name is assigned dynamically and"
-        echo "isn't unique to this tool, so health checks are best-effort until pinned."
-        echo "After your first successful connect, run 'vpnctl status' or check"
-        echo "'vpnctl logs'/'ifconfig' for the utun name it used, then set:"
-        echo "  TUN_IFACE=utunN   in $SETTINGS_FILE"
-        echo "('vpnctl doctor' will keep warning about this until TUN_IFACE is set.)"
+        echo "isn't unique to this tool, so health checks use OpenVPN's own log entry"
+        echo "to identify the interface instead of selecting an unrelated utun."
     fi
 }
 
